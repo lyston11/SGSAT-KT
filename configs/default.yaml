@@ -1,0 +1,141 @@
+# SGSAT-KT Default Configuration
+# 默认配置文件
+
+# Model Settings
+model:
+  name: "DTransformer"
+  d_model: 128
+  n_heads: 8
+  n_layers: 2
+  n_know: 32
+  dropout: 0.2
+  window: 1
+
+# Innovation 1: LLM Semantic Grounding
+llm:
+  use_llm: true
+  llm_weight: 0.3
+  pretrained_model: "pretrained_models/bert-base-chinese"
+  freeze_bert: true
+  max_seq_length: 512
+
+# Innovation 2: GNN Prerequisite Graph
+gnn:
+  use_gnn: true
+  n_kc: 100
+  gnn_layers: 2
+  graph_weight: 0.3
+  dropout: 0.1
+
+# Innovation 3: Graph-Enhanced DCF-Sim
+recommendation:
+  use_graph_similarity: false
+  graph_weight: 0.1
+  cl_loss: false
+  lambda_cl: 0.1
+
+# 预计算嵌入配置
+precomputed:
+  use_precomputed: false  # BERT在线编码，不使用预计算嵌入
+  embeddings_dir: "data/embeddings"
+
+# Training Settings
+training:
+  batch_size: 16  # 双GPU配置（每卡8，安全值）
+  test_batch_size: 8
+  n_epochs: 20
+  learning_rate: 0.001
+  l2: 0.00001
+  early_stop: 5
+  device: "cuda"
+  with_pid: false
+  save_model: true
+  dataset: "xes"  # 默认数据集
+  gradient_accumulation_steps: 2  # 梯度累积，模拟batch_size=32
+
+# GPU Settings
+gpu:
+  # GPU设备ID列表 (例如: [0, 1, 2, 3])
+  # 设为 null 则使用所有可用GPU
+  device_ids: [0, 1]
+
+  # 主GPU (用于多GPU训练)
+  primary_gpu: 0
+
+  # 是否使用DataParallel (简单多GPU)
+  use_data_parallel: true
+
+# Data Settings
+data:
+  dataset_dir: "data"
+  datasets:
+    - assist09
+    - assist17
+    - statics
+    - algebra05
+    - doudouyun
+
+# Output Settings
+output:
+  output_dir: "output"
+  log_interval: 10
+  save_interval: 5
+
+# Evaluation Settings
+evaluation:
+  metrics:
+    - auc
+    - acc
+    - mae
+    - rmse
+
+# =================== 预设配置 ===================
+# 快速切换训练模式，所有参数都可以在这里修改
+presets:
+  # 快速测试（验证代码）
+  test:
+    training:
+      batch_size: 32
+      n_epochs: 5
+      early_stop: 3
+    llm:
+      use_llm: false
+    gnn:
+      use_gnn: false
+
+  # 基线模型（无增强）
+  baseline:
+    training:
+      batch_size: 32
+      n_epochs: 100
+    llm:
+      use_llm: false
+    gnn:
+      use_gnn: false
+
+  # 完整模型（LLM + GNN）
+  full:
+    training:
+      batch_size: 16  # 每卡8，梯度累积2步=有效batch 32
+      gradient_accumulation_steps: 2
+      n_epochs: 30
+      early_stop: 999  # 禁用早停，跑满30轮
+    llm:
+      use_llm: true
+      pretrained_model: "pretrained_models/bert-base-chinese"
+    gnn:
+      use_gnn: true
+    recommendation:
+      cl_loss: true
+
+  # 生产环境（最佳性能）
+  prod:
+    training:
+      batch_size: 32  # 双GPU配置
+      n_epochs: 200
+      learning_rate: 0.0005
+    llm:
+      use_llm: true
+    gnn:
+      gnn_layers: 3
+      use_gnn: true

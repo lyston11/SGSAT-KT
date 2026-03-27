@@ -1,0 +1,25 @@
+# SGSAT-KT 依赖项
+# 核心依赖
+torch==2.3.1
+numpy==2.0.2
+tqdm==4.67.1
+tomlkit==0.14.0
+
+# 科学计算
+scipy==1.13.1
+scikit-learn==1.4.2
+pandas==2.2.2
+
+# LLM语义Grounding (兼容PyTorch 2.0.1)
+transformers==4.49.0
+sentence-transformers==5.3.0
+
+# 可视化
+matplotlib==3.10.7
+
+# 配置文件
+pyyaml==6.0.3
+
+# GNN图神经网络（可选，提升性能）
+# 注意：torch_geometric 需要匹配 CUDA 版本
+# CUDA 11.6 用户使用下方安装命令

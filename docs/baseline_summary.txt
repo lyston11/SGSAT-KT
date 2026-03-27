@@ -1,0 +1,49 @@
+===========================================
+XES Baseline Training Results (Complete)
+===========================================
+Dataset: XES (6,530 questions, Chinese text)
+Configuration: batch_size=4, 10 epochs, no LLM/GNN
+
+Training Progress:
+  Epoch  1: AUC 0.7732
+  Epoch  2: AUC 0.8031 (+3.0%)
+  Epoch  3: AUC 0.8076 (+0.5%)
+  Epoch  4: AUC 0.8151 (+0.8%)
+  Epoch  5: AUC 0.8185 (+0.3%)
+  Epoch  6: AUC 0.8216 (+0.3%)
+  Epoch  7: AUC 0.8229 (+0.1%)
+  Epoch  8: AUC 0.8240 (+0.1%) ← Best
+  Epoch  9: AUC 0.8236 (-0.0%)
+  Epoch 10: AUC 0.8258 (+0.2%)
+
+Best Model: model-008-0.8240.pt (AUC 0.8240)
+Final Model: model-010-0.8258.pt (AUC 0.8258)
+
+Total Training Time: ~60 minutes (~6 min/epoch)
+Model Size: ~4.7 MB per checkpoint
+
+===========================================
+Next Step: LLM Training (Innovation Point 1)
+===========================================
+✓ Text data prepared: 6,530 Chinese questions
+✓ BERT tokenizer tested: bert-base-chinese (local)
+✓ Model integration tested: Forward pass successful
+✓ LLM training script ready: scripts/train_llm.py
+
+Expected Configuration:
+  - batch_size=2 (smaller due to BERT memory)
+  - llm_weight=0.3 (30% LLM, 70% ID embedding)
+  - use_llm=True
+  - pretrained_model=/home1/LT/SGSAT-KT/pretrained_models/bert-base-chinese
+  - freeze_bert=True (to reduce memory and training time)
+
+Command to Run:
+  cd /home1/LT/SGSAT-KT
+  /home1/miniconda3/envs/LT_xktN/bin/python3 scripts/train_llm.py \
+    -d xes -n 10 -bs 2 -tbs 2 \
+    --use_llm --llm_weight 0.3 \
+    --pretrained_model /home1/LT/SGSAT-KT/pretrained_models/bert-base-chinese \
+    -o output/xes_llm \
+    --device cuda:1 \
+    2>&1 | tee train_xes_llm.log
+

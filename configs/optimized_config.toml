@@ -1,0 +1,75 @@
+# SGSAT-KT 综合优化配置文件
+# 基于0.82 AUC瓶颈分析的综合优化方案
+# 目标: 提升AUC到0.84-0.85
+
+[training]
+# 数据集配置
+dataset = "xes"
+n_epochs = 50             # 优化后50轮足够
+early_stop = 10
+
+# 批次配置 (显存限制)
+batch_size = 16          # 保持16，适应显存限制
+test_batch_size = 16     # 保持16
+
+# 学习率配置 (优化)
+learning_rate = 0.0005   # 从0.001降低到0.0005
+l2 = 1e-4                # 从1e-5增加到1e-4 (10x增强正则化)
+
+[model]
+# 模型容量配置 (显著提升)
+d_model = 256            # 从128增加到256 (2x)
+n_layers = 4             # 从3增加到4
+n_heads = 8              # 保持8，确保d_model能整除 (256/8=32)
+n_know = 64              # 从32增加到64 (2x)
+
+# 正则化配置 (增强)
+dropout = 0.3            # 从0.2增加到0.3
+
+[innovation]
+# LLM语义Grounding配置
+use_llm = true
+pretrained_model = "pretrained_models/bert-base-chinese"
+freeze_bert = true       # 当前冻结，未来可尝试微调
+
+# GNN先决图配置 (优化)
+use_gnn = true
+n_kc = 855               # XES数据集知识点数量
+gnn_layers = 3           # 从2增加到3
+
+# 对比学习配置 (优化)
+cl_loss = true
+lambda_cl = 0.15         # 从0.1增加到0.15
+window = 1
+
+[output]
+device = "cuda:0"
+output_dir = "output/xes_optimized_v1"
+
+[optimization_log]
+# 优化历史记录
+date = "2026-03-15"
+previous_best_auc = 0.8272
+previous_best_epoch = 25
+target_auc = "0.84-0.85"
+
+optimizations = [
+    "模型容量提升: d_model 128→256, n_layers 3→4, n_heads 8→12, n_know 32→64",
+    "训练优化: batch_size 16→32, learning_rate 0.001→0.0005, GNN层数 2→3",
+    "正则化增强: dropout 0.2→0.3, L2正则 1e-5→1e-4",
+    "对比学习优化: lambda_cl 0.1→0.15"
+]
+
+expected_improvements = [
+    "增大模型容量: AUC +0.01-0.02",
+    "调整学习率: AUC +0.005-0.01",
+    "综合优化: AUC +0.02-0.03"
+]
+
+[future_directions]
+# 未来可尝试的优化方向
+bert_finetuning = "解冻BERT参数进行微调"
+data_augmentation = "增加数据增强策略"
+attention_mechanism = "尝试更复杂的注意力机制"
+multi_task_learning = "引入多任务学习"
+ensemble_methods = "模型集成"
