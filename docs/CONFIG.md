@@ -124,6 +124,17 @@ recommendation:
   cl_loss: true              # 是否使用对比损失
 ```
 
+### v3.0 新增参数
+
+```yaml
+model:
+  id_dropout_rate: 0.15    # ID embedding dropout 概率（迫使模型依赖 LLM）
+
+llm:
+  lambda_contra: 0.3          # 辅助嵌入对比损失权重
+  contrast_temperature: 0.07  # InfoNCE 温度
+```
+
 ## 🚀 使用方法
 
 ### 方法1: 一键训练（推荐）

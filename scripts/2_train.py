@@ -262,9 +262,12 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
         if config.get('use_llm', False) and q_texts is not None:
             q_text_input = prepare_bert_inputs(q_texts, q, tokenizer)
 
-        # 准备GNN输入
+        # 准备GNN输入 / LLM对比损失输入
         kc_ids = None
-        if config.get('use_gnn', False) and q_to_kc_mapping is not None:
+        need_kc_ids = config.get('use_gnn', False) or (
+            config.get('use_llm', False) and config.get('llm_lambda_contra', config.get('lambda_contra', 0)) > 0
+        )
+        if need_kc_ids and q_to_kc_mapping is not None:
             n_kc = config.get('gnn_n_kc', config.get('n_kc', None))
             kc_ids = add_kc_ids_to_batch(q, q_to_kc_mapping, n_kc)
             # 注意：add_kc_ids_to_batch 已经处理了 list 情况
@@ -625,6 +628,9 @@ def main():
         id_dim=config.get('model_id_dim', config.get('id_dim', 128)),
         llm_proj_dim=config.get('model_llm_proj_dim', config.get('llm_proj_dim', 256)),
         llm_inter_dim=config.get('model_llm_inter_dim', config.get('llm_inter_dim', 512)),
+        id_dropout_rate=config.get('model_id_dropout_rate', config.get('id_dropout_rate', 0.15)),
+        lambda_contra=config.get('llm_lambda_contra', config.get('lambda_contra', 0.3)),
+        contrast_temperature=config.get('llm_contrast_temperature', config.get('contrast_temperature', 0.07)),
         use_gnn=config.get('use_gnn', False),
         n_kc=final_n_kc,
         gnn_layers=config.get('gnn_gnn_layers', config.get('gnn_layers', 2)),

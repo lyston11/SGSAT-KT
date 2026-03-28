@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v1.0** — 基于 SATKT 框架，扩展 LLM 语义嵌入 + GNN 先决图 + 对比学习
+**v3.0** — 门控融合 + 辅助 InfoNCE 对比损失
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -14,6 +14,9 @@
 | id_dim | 128 (ID embedding 固定) |
 | llm_proj_dim | 256 (LLM 投影目标) |
 | llm_inter_dim | 512 (LLM 中间投影) |
+| id_dropout_rate | 0.15 (v3.0 新增) |
+| lambda_contra | 0.3 (v3.0 新增) |
+| contrast_temperature | 0.07 (v3.0 新增) |
 | 知识组件数 | 32 |
 | 注意力头数 | 8 |
 
@@ -36,18 +39,29 @@
 
 ### Embedding 阶段
 
-题目嵌入由三路信号相加得到：
+v3.0 采用门控融合机制动态平衡 ID 和 LLM 信号：
 
 ```
-q_emb = ID_Embedding(q_id) + proj_q(LLM_vec) + W_p(proj_kc(KC_vec)) + GNN(kc_ids)
+# 多层投影（保留 v2.0 改进）
+llm_vec = pkl查表(2560) → Linear(2560→512)→GELU→LN→Linear(512→256)→LN
+
+# 门控融合（v3.0 新增）
+gate = sigmoid(Linear(256)(llm_vec))        # 门控值 [0,1]
+gated_llm = gate * llm_vec                   # 门控 LLM 信号
+id_proj = Linear(128→256)(ID_Embedding)      # ID 投影到同维度
+q_emb = LayerNorm(gated_llm + id_proj)       # 同维度融合
+
+# GNN 先决图（保留）
+q_emb = q_emb + GNN(kc_ids, edge_index)
 ```
 
 - **ID Embedding**: `nn.Embedding(n_questions+1, 128)` — 可学习的题目 ID 查表
-- **LLM 投影**: `nn.Linear(hidden_size, 128)` — 预训练模型嵌入的线性投影（可学习）
-- **KC 融合门**: `W_p = nn.Linear(128, 128, bias=False)` — 知识点嵌入融合权重
+- **ID Dropout** (v3.0): 训练时 p=0.15 将 ID 置零，迫使模型依赖 LLM
+- **LLM 门控**: `sigmoid(W_g · llm_vec) * llm_vec` — 动态调节 LLM 信号贡献
+- **KC 融合门**: `W_p = nn.Linear(256, 256, bias=False)` — 知识点嵌入融合权重
 - **GNN**: `SimpleGCNLayer × 2` — 先决图消息传递，带残差 LayerNorm
 
-作答嵌入: `s_emb = nn.Embedding(2, 128)(s) + q_emb`
+作答嵌入: `s_emb = nn.Embedding(2, 256)(s) + q_emb`
 
 ### Transformer 主干 (n_layers=2)
 
@@ -66,7 +80,7 @@ Block2: cross-attention(Q=q_emb, V=s_emb) — 题目-作答交叉注意力
 ### 知识组件发现
 
 ```
-know_params [32, 128]  →  expand  →  Block4 cross-attn(know→hidden)  →  z [B,L,4096]
+know_params [32, 256]  →  expand  →  Block4 cross-attn(know→hidden)  →  z [B,L,8192]
 ```
 
 ### 预测头
@@ -77,7 +91,7 @@ h = alpha @ z                         → 加权知识状态
 y = MLP(concat[query, h])             → 256 → 256 → 128 → 1
 ```
 
-MLP 结构: `Linear(256→256) → GELU → Dropout → Linear(256→128) → GELU → Dropout → Linear(128→1)`
+MLP 结构: `Linear(512→256) → GELU → Dropout → Linear(256→128) → GELU → Dropout → Linear(128→1)`
 
 ### 损失函数
 
@@ -88,12 +102,13 @@ loss = weighted_BCE + 0.05 * knowledge_consistency + reg_loss
 
 **完整模式** (full/prod, `cl_loss=True`):
 ```
-loss = weighted_BCE + lambda_cl * contrastive_loss + reg_loss
+loss = weighted_BCE + lambda_cl * sequence_CL + lambda_contra * embedding_InfoNCE + reg_loss
 ```
 
 - `weighted_BCE`: 错题权重 1.2 的二元交叉熵
 - `knowledge_consistency`: 余弦相似度惩罚，鼓励知识组件表示多样性
-- `contrastive_loss`: 序列增强 (随机交换) + 硬负样本 (翻转标签) 对比学习，温度 0.05
+- `sequence_CL`: 序列增强 (随机交换) + 硬负样本 (翻转标签) 序列级对比学习，温度 0.05
+- `embedding_InfoNCE` (v3.0 新增): LLM 投影空间 in-batch 对比损失，同 KC 题目靠近，不同 KC 题目远离，温度 0.07
 - `reg_loss`: `p_diff^2 * 1e-3`（仅使用 pid 时）
 
 ## 可用模式
@@ -132,13 +147,24 @@ gnn:
 - `use_gnn: True` + `gnn_edges: <num>` — 先决图已接入
 - `use_cl_loss: True` — 对比学习损失已启用
 
-## v1.0 已知瓶颈
+## 版本历史
 
-1. **20:1 压缩瓶颈**: Qwen3-4B 2560维 → 单层 Linear → 128维，信息损失严重
-2. **简单加法融合**: ID/LLM/GNN 三路信号直接相加，LLM 信号容易被 ID embedding 淹没
-3. **无多层投影**: 缺少非线性变换和残差连接
+### v3.0 (当前)
+- 门控融合: `sigmoid(W_g · llm) * llm + Linear(id)` 替代 concat+project
+- 辅助 InfoNCE 对比损失: 强制 LLM 投影空间结构化
+- ID Dropout (p=0.15): 训练时随机置零 ID，迫使模型依赖 LLM
 
-> 这些瓶颈是下一版本迭代的核心优化方向。
+### v2.0
+- 多层漏斗投影: `2560 → 512 → 256` 两层 GELU+LN 投影
+- 拼接融合: ID(128) + LLM(256) = 384 → Linear(384, 256)
+- d_model 从 128 提升到 256
+
+**v2.0 问题**: concat 融合允许 `W_llm` 退化为零，LLM 信号未参与训练。
+
+### v1.0
+- 单层 Linear(2560→128) 压缩
+- 简单加法融合
+- 20:1 信息瓶颈，LLM 信号被 ID 淹没
 
 ## 常见问题
 

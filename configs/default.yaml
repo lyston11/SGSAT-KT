@@ -14,6 +14,7 @@ model:
   id_dim: 128           # ID embedding 固定维度
   llm_proj_dim: 256     # LLM 投影目标维度
   llm_inter_dim: 512    # LLM 中间投影维度
+  id_dropout_rate: 0.15 # ID embedding dropout 概率（迫使模型依赖 LLM 信号）
 
 # Innovation 1: LLM Semantic Grounding
 llm:
@@ -22,6 +23,8 @@ llm:
   pretrained_model: "pretrained_models/qwen3-4b"
   freeze_bert: true
   max_seq_length: 512
+  lambda_contra: 0.3          # 辅助对比损失权重（v3.0）
+  contrast_temperature: 0.07  # InfoNCE 温度（v3.0）
 
 # Innovation 2: GNN Prerequisite Graph
 gnn:
@@ -110,7 +113,8 @@ presets:
   # 基线模型（无增强）
   baseline:
     training:
-      batch_size: 32
+      batch_size: 8
+      gradient_accumulation_steps: 4
       n_epochs: 100
     llm:
       use_llm: false
@@ -127,6 +131,8 @@ presets:
     llm:
       use_llm: true
       pretrained_model: "pretrained_models/qwen3-4b"
+      lambda_contra: 0.3
+      contrast_temperature: 0.07
     gnn:
       use_gnn: true
     recommendation:

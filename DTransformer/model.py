@@ -117,9 +117,9 @@ class LLMGrounding(nn.Module):
 
 class LLMGroundingWithID(nn.Module):
     """
-    结合ID嵌入和LLM语义嵌入的混合嵌入模块（v2: 拼接+投影融合）
+    结合ID嵌入和LLM语义嵌入的混合嵌入模块（v3: 门控融合）
     ID embedding 固定为 id_dim，LLM 投影到 llm_proj_dim，
-    拼接后投影到 d_model。
+    通过门控机制融合，投影到 d_model。
     """
     def __init__(
         self,
@@ -130,7 +130,8 @@ class LLMGroundingWithID(nn.Module):
         llm_inter_dim=512,
         pretrained_model="pretrained_models/qwen3-4b",
         freeze_bert=True,
-        use_llm=True
+        use_llm=True,
+        id_dropout_rate=0.15,
     ):
         super().__init__()
         self.use_llm = use_llm
@@ -148,9 +149,11 @@ class LLMGroundingWithID(nn.Module):
                 llm_inter_dim=llm_inter_dim,
                 pretrained_model=pretrained_model, freeze_bert=freeze_bert,
             )
-            # 拼接融合投影: id_dim + llm_proj_dim -> d_model
-            self.fusion_proj = nn.Linear(id_dim + llm_proj_dim, d_model)
-            self.fusion_norm = nn.LayerNorm(d_model)
+            # v3: 门控融合
+            self.id_to_llm_proj = nn.Linear(id_dim, llm_proj_dim)
+            self.gate_linear = nn.Linear(llm_proj_dim, llm_proj_dim)
+            self.id_dropout = nn.Dropout(p=id_dropout_rate)
+            self.fusion_norm = nn.LayerNorm(llm_proj_dim)
         else:
             self.id_proj = nn.Linear(id_dim, d_model)
 
@@ -168,14 +171,20 @@ class LLMGroundingWithID(nn.Module):
         if not self.use_llm or q_text_input is None:
             return self.id_proj(id_emb)
 
+        # v3: ID Dropout（仅训练时）
+        if self.training:
+            id_emb = self.id_dropout(id_emb)
+
         llm_emb = self.llm(q_text_input, kc_text_input)  # (batch*seq_len, llm_proj_dim)
 
         batch_size, seq_len, _ = id_emb.size()
         llm_emb = llm_emb.view(batch_size, seq_len, self.llm_proj_dim)
 
-        # 拼接融合: cat(id_emb[id_dim], llm_emb[llm_proj_dim]) -> d_model
-        concat = torch.cat([id_emb, llm_emb], dim=-1)
-        combined = self.fusion_norm(self.fusion_proj(concat))
+        # v3: 门控融合
+        id_proj = self.id_to_llm_proj(id_emb)               # [B, L, llm_proj_dim]
+        gate_val = torch.sigmoid(self.gate_linear(llm_emb))  # [B, L, llm_proj_dim]
+        gated_llm = gate_val * llm_emb                       # [B, L, llm_proj_dim]
+        combined = self.fusion_norm(gated_llm + id_proj)     # [B, L, llm_proj_dim] = d_model
         return combined
 
 
@@ -364,6 +373,9 @@ class DTransformer(nn.Module):
         id_dim=128,
         llm_proj_dim=256,
         llm_inter_dim=512,
+        id_dropout_rate=0.15,
+        lambda_contra=0.3,
+        contrast_temperature=0.07,
         # ============ 修改点2参数: GNN先决图 ============
         n_kc=100,
         use_gnn=False,
@@ -377,8 +389,9 @@ class DTransformer(nn.Module):
         self.use_precomputed_llm = False
         self.id_dim = id_dim
         self.llm_proj_dim = llm_proj_dim
-
         self.llm_inter_dim = llm_inter_dim
+        self.lambda_contra = lambda_contra
+        self.contrast_temperature = contrast_temperature
 
         # ============ 修改点1: LLM语义Grounding嵌入层 ============
         if use_llm:
@@ -391,6 +404,7 @@ class DTransformer(nn.Module):
                     llm_inter_dim=llm_inter_dim,
                     precomputed_embeddings=precomputed_embeddings,
                     use_llm=True,
+                    id_dropout_rate=id_dropout_rate,
                 )
                 self.use_precomputed_llm = True
             else:
@@ -403,6 +417,7 @@ class DTransformer(nn.Module):
                     pretrained_model=pretrained_model,
                     freeze_bert=freeze_bert,
                     use_llm=True,
+                    id_dropout_rate=id_dropout_rate,
                 )
         else:
             # 原SATKT嵌入层（向后兼容）
@@ -626,11 +641,24 @@ class DTransformer(nn.Module):
         loss = (sim_matrix - mask).pow(2).sum() / (batch_size * seq_len * (batch_size * seq_len - 1))
         return consistency_weight * loss
 
-    def get_loss(self, q, s, pid=None, kc_ids=None, edge_index=None, 
+    def compute_embedding_contrastive_loss(self, q, kc_ids=None):
+        """
+        v3: 计算嵌入级对比损失（InfoNCE）
+
+        在 LLM 投影空间上施加辅助对比损失，强制同 KC 题目的 LLM 投影靠近。
+        """
+        if not self.use_llm or not self.use_precomputed_llm:
+            return torch.tensor(0.0, device=q.device)
+
+        return self.q_embed.compute_contrastive_loss(
+            q, kc_ids, self.contrast_temperature
+        )
+
+    def get_loss(self, q, s, pid=None, kc_ids=None, edge_index=None,
                  q_text_input=None, kc_text_input=None,
                  neg_weight=1.2, consistency_weight=0.05):
         """
-        计算损失（支持LLM文本输入）
+        计算损失（支持LLM文本输入 + v3辅助对比损失）
         """
         logits, z, _, reg_loss, _ = self.predict(
             q, s, pid, kc_ids, edge_index, q_text_input, kc_text_input, need_scores=False
@@ -642,6 +670,12 @@ class DTransformer(nn.Module):
         cons_loss = self.knowledge_consistency_loss(z, consistency_weight)
 
         total_loss = bce_loss + cons_loss + reg_loss
+
+        # v3: 辅助嵌入对比损失
+        if self.use_llm and self.lambda_contra > 0:
+            contra_loss = self.compute_embedding_contrastive_loss(q, kc_ids)
+            total_loss = total_loss + self.lambda_contra * contra_loss
+
         return total_loss
 
     def get_cl_loss(self, q, s, pid=None, kc_ids=None, edge_index=None,
@@ -726,7 +760,14 @@ class DTransformer(nn.Module):
             )
         pred_loss /= self.window
 
-        return pred_loss + cl_loss * self.lambda_cl + reg_loss, pred_loss, cl_loss
+        total = pred_loss + cl_loss * self.lambda_cl + reg_loss
+
+        # v3: 辅助嵌入对比损失
+        if self.use_llm and self.lambda_contra > 0:
+            contra_loss = self.compute_embedding_contrastive_loss(q, kc_ids)
+            total = total + self.lambda_contra * contra_loss
+
+        return total, pred_loss, cl_loss
 
     def sim(self, z1, z2):
         bs, seqlen, _ = z1.size()

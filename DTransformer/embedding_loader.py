@@ -1,13 +1,14 @@
 """
-预计算嵌入加载器（v2: 多层投影 + 拼接融合）
-加载离线预计算的 Qwen 语义嵌入，通过多层投影保留更多语义信息，
-并与 ID embedding 拼接后投影到 d_model。
+预计算嵌入加载器（v3: 门控融合 + 辅助 InfoNCE 对比损失）
+加载离线预计算的 Qwen 语义嵌入，通过门控机制动态融合 ID/LLM 信号，
+并施加辅助对比损失强制 LLM 投影空间保持结构化。
 """
 import os
 import pickle
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class PrecomputedEmbeddings:
@@ -205,10 +206,17 @@ class PrecomputedEmbeddingLayer(nn.Module):
 
 class LLMGroundingWithPrecomputed(nn.Module):
     """
-    结合ID嵌入和预计算LLM语义嵌入的混合嵌入模块（v2: 拼接+投影融合）
+    结合ID嵌入和预计算LLM语义嵌入的混合嵌入模块（v3: 门控融合 + 辅助对比损失）
 
-    ID embedding 固定为 id_dim=128，不跟随 d_model 变化。
-    LLM embedding 投影到 llm_proj_dim=256，后与 ID 拼接为 384，再投影到 d_model=256。
+    v3.0 改动:
+    - 门控融合: sigmoid(W_g · llm_emb) * llm_emb + Linear(id_emb)
+    - ID Dropout: 训练时以 p=0.15 将 ID 嵌入置零，迫使模型依赖 LLM
+    - 辅助 InfoNCE: 在 LLM 投影空间施加对比损失，防止门控退化为零
+
+    维度流:
+      id_emb [B,L,128] → id_to_llm_proj → [B,L,256]
+      llm_emb [B,L,256] → gate(sigmoid) → gated_llm [B,L,256]
+      combined = LN(gated_llm + id_to_llm_proj(id_emb)) → [B,L,256] = d_model
     """
     def __init__(
         self,
@@ -218,13 +226,13 @@ class LLMGroundingWithPrecomputed(nn.Module):
         llm_proj_dim=256,
         llm_inter_dim=512,
         precomputed_embeddings=None,
-        use_llm=True
+        use_llm=True,
+        id_dropout_rate=0.15,
     ):
         super().__init__()
         self.use_llm = use_llm
         self.d_model = d_model
         self.id_dim = id_dim
-
         self.llm_proj_dim = llm_proj_dim
 
         # ID 嵌入（固定 id_dim 维，不跟随 d_model）
@@ -238,9 +246,24 @@ class LLMGroundingWithPrecomputed(nn.Module):
                 llm_inter_dim=llm_inter_dim,
                 use_llm=True,
             )
-            # 拼接融合投影: id_dim + llm_proj_dim -> d_model
-            self.fusion_proj = nn.Linear(id_dim + llm_proj_dim, d_model)
-            self.fusion_norm = nn.LayerNorm(d_model)
+
+            # v3: ID → LLM 维度投影（128 → 256），用于同维度融合
+            self.id_to_llm_proj = nn.Linear(id_dim, llm_proj_dim)
+
+            # v3: 门控网络
+            self.gate_linear = nn.Linear(llm_proj_dim, llm_proj_dim)
+
+            # v3: ID Dropout
+            self.id_dropout = nn.Dropout(p=id_dropout_rate)
+
+            # v3: 融合后 LayerNorm（输出 llm_proj_dim = d_model）
+            self.fusion_norm = nn.LayerNorm(llm_proj_dim)
+
+            # v3: 对比损失投影头（降维到 128 加速计算）
+            self.contrast_head = nn.Linear(llm_proj_dim, 128)
+
+            print(f"✅ 使用门控融合+对比损失(v3): id_dim={id_dim}, llm_proj_dim={llm_proj_dim}, "
+                  f"id_dropout={id_dropout_rate}")
         else:
             self.llm_layer = None
             # 无 LLM 时直接投影 ID 到 d_model
@@ -260,10 +283,97 @@ class LLMGroundingWithPrecomputed(nn.Module):
             # 无 LLM 时: 投影 ID 到 d_model
             return self.id_proj(id_emb)
 
+        # v3: ID Dropout（仅训练时）
+        if self.training:
+            id_emb = self.id_dropout(id_emb)
+
         # 获取预计算的 LLM 嵌入 (batch, seq_len, llm_proj_dim)
         llm_emb = self.llm_layer(q_ids, kc_ids)
 
-        # 拼接融合: cat(id_emb, llm_emb) -> 投影到 d_model
-        concat = torch.cat([id_emb, llm_emb], dim=-1)
-        combined = self.fusion_norm(self.fusion_proj(concat))
+        # v3: 门控融合
+        id_proj = self.id_to_llm_proj(id_emb)               # [B, L, llm_proj_dim]
+        gate_val = torch.sigmoid(self.gate_linear(llm_emb))  # [B, L, llm_proj_dim]
+        gated_llm = gate_val * llm_emb                       # [B, L, llm_proj_dim]
+        combined = self.fusion_norm(gated_llm + id_proj)     # [B, L, llm_proj_dim] = d_model
         return combined
+
+    def compute_contrastive_loss(self, q_ids, kc_ids=None, temperature=0.07):
+        """
+        v3: 辅助 InfoNCE 对比损失
+
+        在 LLM 投影空间上施加 in-batch 对比损失，强制同 KC 题目的
+        LLM 投影靠近，不同 KC 题目的投影远离。
+
+        Args:
+            q_ids: 题目ID (batch, seq_len)
+            kc_ids: 知识点ID (batch, seq_len) [可选，用于正样本配对]
+            temperature: InfoNCE 温度
+        Returns:
+            loss: scalar
+        """
+        if self.llm_layer is None:
+            return torch.tensor(0.0, device=q_ids.device, requires_grad=True)
+
+        # 获取 LLM 投影特征（不经过 gate，直接取投影输出）
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            llm_emb = self.llm_layer(q_ids, kc_ids)  # [B, L, llm_proj_dim]
+        batch_size, seq_len, dim = llm_emb.shape
+
+        # Flatten: [B*L, llm_proj_dim]
+        llm_flat = llm_emb.reshape(-1, dim)
+
+        # 对比头降维 + L2 normalize
+        z = self.contrast_head(llm_flat)     # [B*L, 128]
+        z = F.normalize(z, p=2, dim=-1)
+
+        # 限制采样数量以控制显存（取前 512 个 token）
+        n_tokens = z.size(0)
+        max_tokens = 512
+        if n_tokens > max_tokens:
+            indices = torch.randperm(n_tokens, device=z.device)[:max_tokens]
+            z = z[indices]
+            n_tokens = max_tokens
+
+        # 相似度矩阵
+        sim_matrix = torch.matmul(z, z.T) / temperature  # [N, N]
+
+        # 构造正样本掩码
+        if kc_ids is not None:
+            kc_flat = kc_ids.reshape(-1)  # [B*L]
+            if kc_flat.size(0) > max_tokens:
+                kc_flat = kc_flat[indices]
+            # 同一 KC 的 token 对为正样本
+            kc_mask = kc_flat.unsqueeze(0) == kc_flat.unsqueeze(1)  # [N, N]
+        else:
+            # 无 KC 信息: 每个 token 自身为正样本（标准 in-batch）
+            kc_mask = torch.eye(n_tokens, device=z.device, dtype=torch.bool)
+
+        # 排除自身（对角线）
+        self_mask = torch.eye(n_tokens, device=z.device, dtype=torch.bool)
+        positive_mask = kc_mask & ~self_mask  # [N, N]
+
+        # InfoNCE loss
+        # 对数值稳定性的处理：减去最大值
+        sim_max = sim_matrix.detach().max(dim=-1, keepdim=True).values
+        logits = sim_matrix - sim_max
+
+        # 分母：所有非自身样本
+        exp_logits = torch.exp(logits) * ~self_mask
+        log_sum_exp = torch.log(exp_logits.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # 分子：正样本
+        # 只计算有正样本的行
+        has_pos = positive_mask.sum(dim=-1) > 0
+        if has_pos.sum() == 0:
+            # 没有正样本对，返回零损失
+            return torch.tensor(0.0, device=q_ids.device, requires_grad=True)
+
+        pos_logits = (logits * positive_mask).sum(dim=-1)  # 对正样本求和
+        n_pos = positive_mask.sum(dim=-1).clamp(min=1)     # 正样本数量
+        pos_mean_logit = pos_logits / n_pos
+
+        # loss = -log(exp(pos) / sum_exp(all))
+        loss_per_sample = -pos_mean_logit + log_sum_exp.squeeze(-1)
+        loss = loss_per_sample[has_pos].mean()
+
+        return loss
