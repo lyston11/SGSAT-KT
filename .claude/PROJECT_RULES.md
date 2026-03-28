@@ -10,7 +10,7 @@
 
 ### 2. 总运行脚本（推荐给新用户）
 ```bash
-./train.sh full    # 自动预计算 + 训练
+./scripts/train.sh full    # 自动预计算 + 训练
 ```
 
 ### 3. 每个Python脚本都要有对应的Shell脚本
@@ -18,7 +18,7 @@
 - `2_train.py` → `2_train.sh`
 
 ### 4. 调参在配置文件
-编辑 `scripts/configs.py` 调参。
+编辑 `configs/default.yaml` 调参。
 
 ### 5. 文档精简
 只保留核心文档，删除冗余内容。

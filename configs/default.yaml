@@ -15,7 +15,7 @@ model:
 llm:
   use_llm: true
   llm_weight: 0.3
-  pretrained_model: "pretrained_models/bert-base-chinese"
+  pretrained_model: "pretrained_models/qwen3-4b"
   freeze_bert: true
   max_seq_length: 512
 
@@ -36,7 +36,7 @@ recommendation:
 
 # 预计算嵌入配置
 precomputed:
-  use_precomputed: false  # BERT在线编码，不使用预计算嵌入
+  use_precomputed: true  # Qwen3预计算嵌入
   embeddings_dir: "data/embeddings"
 
 # Training Settings
@@ -122,7 +122,7 @@ presets:
       early_stop: 999  # 禁用早停，跑满30轮
     llm:
       use_llm: true
-      pretrained_model: "pretrained_models/bert-base-chinese"
+      pretrained_model: "pretrained_models/qwen3-4b"
     gnn:
       use_gnn: true
     recommendation:

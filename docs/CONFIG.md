@@ -13,10 +13,10 @@
 ### 选择训练模式
 
 ```bash
-./train.sh test      # 快速测试（5轮）
-./train.sh baseline  # 基线模型
-./train.sh full      # 完整模型（LLM+GNN）← 推荐
-./train.sh prod      # 生产环境（200轮）
+./scripts/train.sh test      # 快速测试（5轮）
+./scripts/train.sh baseline  # 基线模型
+./scripts/train.sh full      # 完整模型（LLM+GNN）← 推荐
+./scripts/train.sh prod      # 生产环境（200轮）
 ```
 
 ### 修改配置
@@ -67,17 +67,16 @@ gpu:
 
 ```yaml
 llm:
-  pretrained_model: "pretrained_models/Qwen3-Embedding-4B"
+  pretrained_model: "pretrained_models/qwen3-4b"
 ```
 
 ### 使用 HuggingFace 模型
 
 ```yaml
 llm:
-  pretrained_model: "Qwen/Qwen2.5-1.5B-Instruct"
+  pretrained_model: "pretrained_models/qwen3-4b"
   # 或者
-  pretrained_model: "bert-base-chinese"
-  # 或者其他任何HuggingFace模型
+  pretrained_model: "pretrained_models/bert-base-chinese"
 ```
 
 ## 🏋️ 训练配置
@@ -96,7 +95,7 @@ presets:
 
 使用方式：
 ```bash
-./train.sh full   # 自动应用 full 预设的配置
+./scripts/train.sh full   # 自动应用 full 预设的配置
 ```
 
 ### 自定义参数
@@ -131,12 +130,12 @@ recommendation:
 
 ```bash
 # 使用默认配置（full模式）
-./train.sh full
+./scripts/train.sh full
 
 # 使用其他模式
-./train.sh test      # 快速测试
-./train.sh baseline  # 基线模型
-./train.sh prod      # 生产环境
+./scripts/train.sh test      # 快速测试
+./scripts/train.sh baseline  # 基线模型
+./scripts/train.sh prod      # 生产环境
 ```
 
 ### 方法2: 分步训练
@@ -293,10 +292,10 @@ output/
 - **prod**: 生产环境（200 epochs，更大批大小）
 
 ```bash
-./train.sh test      # 测试
-./train.sh baseline  # 基线
-./train.sh full      # 完整
-./train.sh prod      # 生产
+./scripts/train.sh test      # 测试
+./scripts/train.sh baseline  # 基线
+./scripts/train.sh full      # 完整
+./scripts/train.sh prod      # 生产
 ```
 
 ## 📞 需要帮助？

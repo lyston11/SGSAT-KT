@@ -60,7 +60,6 @@ class QwenEmbeddingGenerator:
             batch_size=batch_size,
             convert_to_numpy=True,
             show_progress_bar=True,
-            desc=desc
         )
         return embeddings
 
@@ -69,7 +68,7 @@ class QwenEmbeddingGenerator:
         print(f"📝 预计算 {len(questions_data)} 个题目嵌入...")
 
         question_ids = sorted(questions_data.keys())
-        question_texts = [questions_data[qid]["text"] for qid in question_ids]
+        question_texts = [questions_data[qid].get("text") or questions_data[qid].get("content", "") for qid in question_ids]
 
         question_embeddings = self.batch_encode_texts(
             question_texts,

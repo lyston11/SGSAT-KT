@@ -54,10 +54,6 @@ checkpoints/
 logs/
 results/
 runs/
-checkpoints/
-logs/
-results/
-runs/
 *.pt
 *.pth
 *.ckpt
@@ -86,7 +82,6 @@ htmlcov/
 
 # OS
 Thumbs.db
-.DS_Store
 
 # Large files
 *.csv
@@ -96,6 +91,5 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
 *.log.*
 wandb/

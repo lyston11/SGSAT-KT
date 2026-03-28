@@ -19,7 +19,7 @@ install:
 # Quick training
 train:
 	@echo "Starting training..."
-	./train.sh full
+	./scripts/train.sh full
 
 # Full training with all innovations
 train-full:
