@@ -1,6 +1,7 @@
 """
-预计算嵌入加载器
-加载离线预计算的 Qwen 语义嵌入
+预计算嵌入加载器（v2: 多层投影 + 拼接融合）
+加载离线预计算的 Qwen 语义嵌入，通过多层投影保留更多语义信息，
+并与 ID embedding 拼接后投影到 d_model。
 """
 import os
 import pickle
@@ -37,7 +38,7 @@ class PrecomputedEmbeddings:
         self.question_embeddings = data["embeddings"]
         self.question_ids = data["question_ids"]
         self.question_id_to_idx = {int(qid): idx for idx, qid in enumerate(self.question_ids)}
-        self.hidden_size = data.get("hidden_size", 2560)  # Qwen3 默认隐藏层大小
+        self.hidden_size = data.get("hidden_size", 2560)
 
         print(f"✅ 加载了 {len(self.question_ids)} 个题目嵌入")
         print(f"📊 嵌入维度: {self.hidden_size}")
@@ -106,51 +107,69 @@ class PrecomputedEmbeddings:
 
 class PrecomputedEmbeddingLayer(nn.Module):
     """
-    预计算嵌入层
-    替代原来的 LLMGrounding，直接加载预计算的嵌入向量
+    预计算嵌入层（v2: 多层漏斗式投影）
+
+    将 LLM 嵌入通过  hidden_size → inter_dim → proj_dim 的多层投影，
+    保留更多语义信息，不再使用单层 Linear 直接压到 d_model。
     """
-    def __init__(self, precomputed_embeddings, d_model=128, use_llm=True):
+    def __init__(self, precomputed_embeddings, llm_proj_dim=256, llm_inter_dim=512, use_llm=True):
         super().__init__()
         self.use_llm = use_llm
-        self.d_model = d_model
+        self.llm_proj_dim = llm_proj_dim
         self.proj_q = None
         self.proj_kc = None
         self.W_p = None
 
         if use_llm and precomputed_embeddings is not None:
-            # 获取隐藏层大小
             hidden_size = precomputed_embeddings.hidden_size
 
-            # 创建投影层：将预计算的嵌入投影到 d_model 维度
-            self.proj_q = nn.Linear(hidden_size, d_model)
-            self.proj_kc = nn.Linear(hidden_size, d_model)
-            self.W_p = nn.Linear(d_model, d_model, bias=False)
-
-            # 保存预计算嵌入的引用
+            # 多层漏斗式投影: hidden_size → llm_inter_dim → llm_proj_dim
+            self.proj_q = nn.Sequential(
+                nn.Linear(hidden_size, llm_inter_dim),
+                nn.GELU(),
+                nn.LayerNorm(llm_inter_dim),
+                nn.Dropout(0.1),
+                nn.Linear(llm_inter_dim, llm_proj_dim),
+                nn.LayerNorm(llm_proj_dim),
+            )
+            self.proj_kc = nn.Sequential(
+                nn.Linear(hidden_size, llm_inter_dim),
+                nn.GELU(),
+                nn.LayerNorm(llm_inter_dim),
+                nn.Dropout(0.1),
+                nn.Linear(llm_inter_dim, llm_proj_dim),
+                nn.LayerNorm(llm_proj_dim),
+            )
+            self.W_p = nn.Linear(llm_proj_dim, llm_proj_dim, bias=False)
             self.precomputed = precomputed_embeddings
-
-            print(f"✅ 使用预计算嵌入层: {hidden_size} -> {d_model}")
+            print(f"✅ 使用预计算嵌入层(v2多层投影): {hidden_size} -> {llm_inter_dim} -> {llm_proj_dim}")
         else:
             self.precomputed = None
-            print(f"⚠️  未使用预计算嵌入")
+            print("⚠️  未使用预计算嵌入")
+
+    def _get_dtype(self):
+        """获取投影层的数据类型"""
+        if self.proj_q is not None:
+            # Sequential 中第一个是 Linear，直接取其 weight.dtype
+            for module in self.proj_q:
+                if isinstance(module, nn.Linear):
+                    return module.weight.dtype
+        return torch.float32
 
     def forward(self, q_ids, kc_ids=None):
         """
-        前向传播
-
         Args:
             q_ids: 题目ID (batch, seq_len)
             kc_ids: 知识点ID (batch, seq_len) [可选]
-
         Returns:
-            q_emb: 题目嵌入 (batch, seq_len, d_model)
+            q_emb: 题目嵌入 (batch, seq_len, llm_proj_dim)
         """
         if not self.use_llm or self.precomputed is None:
-            # 返回零向量
             batch_size, seq_len = q_ids.shape
-            out_dtype = self.proj_q.weight.dtype if self.proj_q is not None else torch.float32
-            return torch.zeros(batch_size, seq_len, self.d_model,
-                             device=q_ids.device, dtype=out_dtype)
+            return torch.zeros(
+                batch_size, seq_len, self.llm_proj_dim,
+                device=q_ids.device, dtype=self._get_dtype(),
+            )
 
         batch_size, seq_len = q_ids.shape
         q_ids_flat = q_ids.cpu().numpy().flatten().tolist()
@@ -162,10 +181,10 @@ class PrecomputedEmbeddingLayer(nn.Module):
         # 转换为张量
         q_embs = torch.from_numpy(q_embs_np).to(
             device=q_ids.device,
-            dtype=self.proj_q.weight.dtype,
+            dtype=self._get_dtype(),
         )
 
-        # 投影到 d_model 维度
+        # 多层投影
         e_q = self.proj_q(q_embs)
 
         # 如果有知识点，融合知识点嵌入
@@ -175,7 +194,7 @@ class PrecomputedEmbeddingLayer(nn.Module):
             kc_embs_np = kc_embs_np.reshape(batch_size, seq_len, -1)
             kc_embs = torch.from_numpy(kc_embs_np).to(
                 device=kc_ids.device,
-                dtype=self.proj_kc.weight.dtype,
+                dtype=self._get_dtype(),
             )
 
             e_kc = self.proj_kc(kc_embs)
@@ -186,30 +205,46 @@ class PrecomputedEmbeddingLayer(nn.Module):
 
 class LLMGroundingWithPrecomputed(nn.Module):
     """
-    结合ID嵌入和预计算LLM语义嵌入的混合嵌入模块
-    完全替代原来的在线 LLMGrounding
+    结合ID嵌入和预计算LLM语义嵌入的混合嵌入模块（v2: 拼接+投影融合）
+
+    ID embedding 固定为 id_dim=128，不跟随 d_model 变化。
+    LLM embedding 投影到 llm_proj_dim=256，后与 ID 拼接为 384，再投影到 d_model=256。
     """
     def __init__(
         self,
         n_questions,
-        d_model=128,
+        d_model=256,
+        id_dim=128,
+        llm_proj_dim=256,
+        llm_inter_dim=512,
         precomputed_embeddings=None,
         use_llm=True
     ):
         super().__init__()
         self.use_llm = use_llm
         self.d_model = d_model
+        self.id_dim = id_dim
 
-        # ID嵌入
-        self.q_embed = nn.Embedding(n_questions + 1, d_model)
+        self.llm_proj_dim = llm_proj_dim
 
-        # 预计算LLM语义嵌入
+        # ID 嵌入（固定 id_dim 维，不跟随 d_model）
+        self.q_embed = nn.Embedding(n_questions + 1, id_dim)
+
         if use_llm and precomputed_embeddings is not None:
+            # 预计算 LLM 语义嵌入（多层投影到 llm_proj_dim）
             self.llm_layer = PrecomputedEmbeddingLayer(
-                precomputed_embeddings, d_model, use_llm=True
+                precomputed_embeddings,
+                llm_proj_dim=llm_proj_dim,
+                llm_inter_dim=llm_inter_dim,
+                use_llm=True,
             )
+            # 拼接融合投影: id_dim + llm_proj_dim -> d_model
+            self.fusion_proj = nn.Linear(id_dim + llm_proj_dim, d_model)
+            self.fusion_norm = nn.LayerNorm(d_model)
         else:
             self.llm_layer = None
+            # 无 LLM 时直接投影 ID 到 d_model
+            self.id_proj = nn.Linear(id_dim, d_model)
 
     def forward(self, q_ids, kc_ids=None):
         """
@@ -219,15 +254,16 @@ class LLMGroundingWithPrecomputed(nn.Module):
         Returns:
             q_emb: 混合嵌入 (batch, seq_len, d_model)
         """
-        id_emb = self.q_embed(q_ids)
+        id_emb = self.q_embed(q_ids)  # (batch, seq_len, id_dim)
 
         if not self.use_llm or self.llm_layer is None:
-            return id_emb
+            # 无 LLM 时: 投影 ID 到 d_model
+            return self.id_proj(id_emb)
 
-        # 获取预计算的LLM嵌入
+        # 获取预计算的 LLM 嵌入 (batch, seq_len, llm_proj_dim)
         llm_emb = self.llm_layer(q_ids, kc_ids)
 
-        # 混合：ID嵌入 + LLM嵌入
-        combined_emb = id_emb + llm_emb
-
-        return combined_emb
+        # 拼接融合: cat(id_emb, llm_emb) -> 投影到 d_model
+        concat = torch.cat([id_emb, llm_emb], dim=-1)
+        combined = self.fusion_norm(self.fusion_proj(concat))
+        return combined

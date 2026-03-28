@@ -4,12 +4,16 @@
 # Model Settings
 model:
   name: "DTransformer"
-  d_model: 128
+  d_model: 256
+  d_fc: 512
   n_heads: 8
   n_layers: 2
   n_know: 32
   dropout: 0.2
   window: 1
+  id_dim: 128           # ID embedding 固定维度
+  llm_proj_dim: 256     # LLM 投影目标维度
+  llm_inter_dim: 512    # LLM 中间投影维度
 
 # Innovation 1: LLM Semantic Grounding
 llm:

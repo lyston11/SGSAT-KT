@@ -31,20 +31,20 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ============ 修改点1: LLM语义Grounding模块 ============
 class LLMGrounding(nn.Module):
     """
-    LLM语义Grounding模块（创新点1）
-    将题目文本和知识点文本转换为语义嵌入
-    
-    公式: e_q = BERT([Q]q_text + [KC]kc) + W_p * Proj(e_kc)
+    LLM语义Grounding模块（v2: 多层投影）
+    将题目文本和知识点文本通过 BERT + 多层投影转换为语义嵌入
     """
     def __init__(
         self,
         d_model=128,
-        pretrained_model="pretrained_models/Qwen3-Embedding-4B",
+        llm_proj_dim=256,
+        llm_inter_dim=512,
+        pretrained_model="pretrained_models/qwen3-4b",
         freeze_bert=True
     ):
         super().__init__()
         self.d_model = d_model
-        
+
         try:
             from transformers import AutoModel
             self.bert = AutoModel.from_pretrained(pretrained_model)
@@ -56,11 +56,26 @@ class LLMGrounding(nn.Module):
         except ImportError:
             print("Warning: transformers not installed, LLM grounding disabled")
             self.bert = None
-            self.bert_hidden_size = d_model
-        
-        self.proj_q = nn.Linear(self.bert_hidden_size, d_model)
-        self.proj_kc = nn.Linear(self.bert_hidden_size, d_model)
-        self.W_p = nn.Linear(d_model, d_model, bias=False)
+            self.bert_hidden_size = llm_proj_dim
+
+        # 多层漏斗式投影
+        self.proj_q = nn.Sequential(
+            nn.Linear(self.bert_hidden_size, llm_inter_dim),
+            nn.GELU(),
+            nn.LayerNorm(llm_inter_dim),
+            nn.Dropout(0.1),
+            nn.Linear(llm_inter_dim, llm_proj_dim),
+            nn.LayerNorm(llm_proj_dim),
+        )
+        self.proj_kc = nn.Sequential(
+            nn.Linear(self.bert_hidden_size, llm_inter_dim),
+            nn.GELU(),
+            nn.LayerNorm(llm_inter_dim),
+            nn.Dropout(0.1),
+            nn.Linear(llm_inter_dim, llm_proj_dim),
+            nn.LayerNorm(llm_proj_dim),
+        )
+        self.W_p = nn.Linear(llm_proj_dim, llm_proj_dim, bias=False)
         
     def forward(self, q_text_input, kc_text_input=None):
         """
@@ -102,63 +117,66 @@ class LLMGrounding(nn.Module):
 
 class LLMGroundingWithID(nn.Module):
     """
-    结合ID嵌入和LLM语义嵌入的混合嵌入模块（修改点1完整实现）
-    原SATKT: q_emb = self.q_embed(q_id)  # 仅ID embedding
-    修改后（按文档公式3.8）: e_q = BERT([Q]q_text + [KC]k_c) + W_p · Proj(e_kc)
-
-    注意：公式要求加法，而非加权平均或拼接
+    结合ID嵌入和LLM语义嵌入的混合嵌入模块（v2: 拼接+投影融合）
+    ID embedding 固定为 id_dim，LLM 投影到 llm_proj_dim，
+    拼接后投影到 d_model。
     """
     def __init__(
         self,
         n_questions,
-        d_model=128,
-        pretrained_model="pretrained_models/Qwen3-Embedding-4B",
+        d_model=256,
+        id_dim=128,
+        llm_proj_dim=256,
+        llm_inter_dim=512,
+        pretrained_model="pretrained_models/qwen3-4b",
         freeze_bert=True,
         use_llm=True
     ):
         super().__init__()
         self.use_llm = use_llm
         self.d_model = d_model
+        self.id_dim = id_dim
+        self.llm_proj_dim = llm_proj_dim
 
-        # ID嵌入（原SATKT）
-        self.q_embed = nn.Embedding(n_questions + 1, d_model)
+        # ID 嵌入（固定 id_dim 维）
+        self.q_embed = nn.Embedding(n_questions + 1, id_dim)
 
-        # LLM语义嵌入（新增，按文档公式3.8）
+        # LLM 语义嵌入（多层投影到 llm_proj_dim）
         if use_llm:
-            self.llm = LLMGrounding(d_model, pretrained_model, freeze_bert)
+            self.llm = LLMGrounding(
+                d_model, llm_proj_dim=llm_proj_dim,
+                llm_inter_dim=llm_inter_dim,
+                pretrained_model=pretrained_model, freeze_bert=freeze_bert,
+            )
+            # 拼接融合投影: id_dim + llm_proj_dim -> d_model
+            self.fusion_proj = nn.Linear(id_dim + llm_proj_dim, d_model)
+            self.fusion_norm = nn.LayerNorm(d_model)
+        else:
+            self.id_proj = nn.Linear(id_dim, d_model)
 
     def forward(self, q_ids, q_text_input=None, kc_text_input=None):
         """
         Args:
             q_ids: 题目ID (batch, seq_len)
-            q_text_input: 题目文本BERT输入 (每个题目都有独立的BERT输入)
+            q_text_input: 题目文本BERT输入
             kc_text_input: 知识点文本BERT输入
         Returns:
             q_emb: 混合嵌入 (batch, seq_len, d_model)
         """
-        id_emb = self.q_embed(q_ids)
+        id_emb = self.q_embed(q_ids)  # (batch, seq_len, id_dim)
 
         if not self.use_llm or q_text_input is None:
-            return id_emb
+            return self.id_proj(id_emb)
 
-        # 按文档公式3.8: e_q = BERT(...) + W_p * Proj(e_kc)
-        llm_emb = self.llm(q_text_input, kc_text_input)
+        llm_emb = self.llm(q_text_input, kc_text_input)  # (batch*seq_len, llm_proj_dim)
 
-        batch_size, seq_len, d_model = id_emb.size()
+        batch_size, seq_len, _ = id_emb.size()
+        llm_emb = llm_emb.view(batch_size, seq_len, self.llm_proj_dim)
 
-        # llm_emb shape: (batch_size * seq_len, d_model)
-        # 需要reshape为 (batch_size, seq_len, d_model)
-        if llm_emb.size(0) == batch_size * seq_len:
-            llm_emb = llm_emb.view(batch_size, seq_len, d_model)
-        elif llm_emb.dim() == 2 and llm_emb.size(0) == batch_size:
-            # 如果是(batch_size, d_model)，则扩展到seq_len维度
-            llm_emb = llm_emb.unsqueeze(1).expand(-1, seq_len, -1)
-
-        # 按文档要求：直接相加，而非加权平均
-        # 公式3.8: e_q = BERT([Q]q_text + [KC]k_c) + W_p · Proj(e_kc)
-        combined_emb = id_emb + llm_emb
-
-        return combined_emb
+        # 拼接融合: cat(id_emb[id_dim], llm_emb[llm_proj_dim]) -> d_model
+        concat = torch.cat([id_emb, llm_emb], dim=-1)
+        combined = self.fusion_norm(self.fusion_proj(concat))
+        return combined
 
 
 # ============ 修改点2: GNN Prerequisite Graph模块 ============
@@ -327,8 +345,8 @@ class DTransformer(nn.Module):
         self,
         n_questions,
         n_pid=0,
-        d_model=128,
-        d_fc=256,
+        d_model=256,
+        d_fc=512,
         n_heads=8,
         n_know=16,
         n_layers=1,
@@ -339,14 +357,17 @@ class DTransformer(nn.Module):
         window=1,
         shortcut=False,
         # ============ 修改点1参数: LLM语义Grounding ============
-        use_llm=False,          # 是否使用LLM语义嵌入（默认关闭以保证向后兼容）
-        pretrained_model="pretrained_models/Qwen3-Embedding-4B",
+        use_llm=False,
+        pretrained_model="pretrained_models/qwen3-4b",
         freeze_bert=True,
         precomputed_embeddings=None,
+        id_dim=128,
+        llm_proj_dim=256,
+        llm_inter_dim=512,
         # ============ 修改点2参数: GNN先决图 ============
-        n_kc=100,               # 知识点数量
-        use_gnn=False,          # 是否使用GNN（默认关闭以保证向后兼容）
-        gnn_layers=2,           # GNN层数
+        n_kc=100,
+        use_gnn=False,
+        gnn_layers=2,
     ):
         super().__init__()
         self.n_questions = n_questions
@@ -354,6 +375,10 @@ class DTransformer(nn.Module):
         self.use_gnn = use_gnn
         self.use_llm = use_llm
         self.use_precomputed_llm = False
+        self.id_dim = id_dim
+        self.llm_proj_dim = llm_proj_dim
+
+        self.llm_inter_dim = llm_inter_dim
 
         # ============ 修改点1: LLM语义Grounding嵌入层 ============
         if use_llm:
@@ -361,14 +386,23 @@ class DTransformer(nn.Module):
                 self.q_embed = LLMGroundingWithPrecomputed(
                     n_questions,
                     d_model=d_model,
+                    id_dim=id_dim,
+                    llm_proj_dim=llm_proj_dim,
+                    llm_inter_dim=llm_inter_dim,
                     precomputed_embeddings=precomputed_embeddings,
                     use_llm=True,
                 )
                 self.use_precomputed_llm = True
             else:
                 self.q_embed = LLMGroundingWithID(
-                    n_questions, d_model, pretrained_model, freeze_bert,
-                    use_llm=True
+                    n_questions,
+                    d_model=d_model,
+                    id_dim=id_dim,
+                    llm_proj_dim=llm_proj_dim,
+                    llm_inter_dim=llm_inter_dim,
+                    pretrained_model=pretrained_model,
+                    freeze_bert=freeze_bert,
+                    use_llm=True,
                 )
         else:
             # 原SATKT嵌入层（向后兼容）

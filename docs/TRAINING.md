@@ -10,7 +10,10 @@
 | LLM (默认) | Qwen3-4B, 预计算嵌入, hidden_size=2560 |
 | LLM (备选) | BERT-base-chinese, 在线/预计算, hidden_size=768 |
 | GNN | 2层 SimpleGCNLayer |
-| d_model | 128 |
+| d_model | 256 |
+| id_dim | 128 (ID embedding 固定) |
+| llm_proj_dim | 256 (LLM 投影目标) |
+| llm_inter_dim | 512 (LLM 中间投影) |
 | 知识组件数 | 32 |
 | 注意力头数 | 8 |
 
