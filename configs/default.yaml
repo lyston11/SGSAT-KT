@@ -120,8 +120,8 @@ presets:
   # 完整模型（LLM + GNN）
   full:
     training:
-      batch_size: 16  # 每卡8，梯度累积2步=有效batch 32
-      gradient_accumulation_steps: 2
+      batch_size: 8   # d_model=256 后每卡只能4，梯度累积4步=有效batch 32
+      gradient_accumulation_steps: 4
       n_epochs: 30
       early_stop: 999  # 禁用早停，跑满30轮
     llm:
