@@ -438,7 +438,7 @@ def validate(model, valid_data, config, q_texts=None, tokenizer=None,
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="SGSAT-KT 训练脚本")
-    parser.add_argument('mode', choices=['test', 'baseline', 'full', 'prod'], help='训练模式')
+    parser.add_argument('mode', choices=['test', 'baseline', 'full', 'prod', 'sakt', 'akt', 'dkt', 'dkvmn'], help='训练模式')
     parser.add_argument('--device', help='覆盖设备设置')
     args = parser.parse_args()
 
@@ -604,38 +604,53 @@ def main():
 
     # 创建模型
     print("\n🤖 创建模型...")
-    # 确保 n_kc 配置正确
-    final_n_kc = config.get('gnn_n_kc', config.get('n_kc', 100))
-    print(f"📊 使用 n_kc={final_n_kc} 创建模型")
-    if edge_index is not None:
-        print(f"📊 edge_index max_kc={edge_index.max().item()}")
-    model = DTransformer(
-        dataset_config["n_questions"],
-        dataset_config.get("n_pid", 0),
-        d_model=config.get('model_d_model', config.get('d_model', 256)),
-        d_fc=config.get('model_d_fc', config.get('d_fc', 512)),
-        n_heads=config.get('model_n_heads', config.get('n_heads', 8)),
-        n_layers=config.get('model_n_layers', config.get('n_layers', 2)),
-        n_know=config.get('model_n_know', config.get('n_know', 32)),
-        lambda_cl=config.get('recommendation_lambda_cl', config.get('lambda_cl', 0.1)),
-        dropout=config.get('model_dropout', config.get('dropout', 0.2)),
-        proj=config.get('proj', False),
-        hard_neg=config.get('hard_neg', False),
-        window=config.get('model_window', config.get('window', 1)),
-        use_llm=config.get('use_llm', False),
-        pretrained_model=config.get('pretrained_model', 'bert-base-chinese'),
-        precomputed_embeddings=precomputed_embeddings,
-        id_dim=config.get('model_id_dim', config.get('id_dim', 128)),
-        llm_proj_dim=config.get('model_llm_proj_dim', config.get('llm_proj_dim', 256)),
-        llm_inter_dim=config.get('model_llm_inter_dim', config.get('llm_inter_dim', 512)),
-        id_dropout_rate=config.get('model_id_dropout_rate', config.get('id_dropout_rate', 0.15)),
-        lambda_contra=config.get('llm_lambda_contra', config.get('lambda_contra', 0.3)),
-        contrast_temperature=config.get('llm_contrast_temperature', config.get('contrast_temperature', 0.07)),
-        use_gnn=config.get('use_gnn', False),
-        n_kc=final_n_kc,
-        gnn_layers=config.get('gnn_gnn_layers', config.get('gnn_layers', 2)),
-    )
-    print(f"✅ 模型创建完成，实际 n_kc={model.n_kc}")
+    baseline_name = config.get('model__baseline', None)
+    if baseline_name:
+        from baselines import create_baseline_model, BaselineWrapper
+        raw_model = create_baseline_model(
+            baseline_name,
+            dataset_config["n_questions"],
+            d_model=config.get('model_d_model', config.get('d_model', 256)),
+            n_heads=config.get('model_n_heads', config.get('n_heads', 8)),
+            dropout=config.get('model_dropout', config.get('dropout', 0.2)),
+            batch_size=config.get('batch_size', config.get('training_batch_size', 16)),
+            device='cpu',
+        )
+        model = BaselineWrapper(raw_model)
+        print(f"✅ 基线模型创建完成: {baseline_name}")
+    else:
+        # 确保 n_kc 配置正确
+        final_n_kc = config.get('gnn_n_kc', config.get('n_kc', 100))
+        print(f"📊 使用 n_kc={final_n_kc} 创建模型")
+        if edge_index is not None:
+            print(f"📊 edge_index max_kc={edge_index.max().item()}")
+        model = DTransformer(
+            dataset_config["n_questions"],
+            dataset_config.get("n_pid", 0),
+            d_model=config.get('model_d_model', config.get('d_model', 256)),
+            d_fc=config.get('model_d_fc', config.get('d_fc', 512)),
+            n_heads=config.get('model_n_heads', config.get('n_heads', 8)),
+            n_layers=config.get('model_n_layers', config.get('n_layers', 2)),
+            n_know=config.get('model_n_know', config.get('n_know', 32)),
+            lambda_cl=config.get('recommendation_lambda_cl', config.get('lambda_cl', 0.1)),
+            dropout=config.get('model_dropout', config.get('dropout', 0.2)),
+            proj=config.get('proj', False),
+            hard_neg=config.get('hard_neg', False),
+            window=config.get('model_window', config.get('window', 1)),
+            use_llm=config.get('use_llm', False),
+            pretrained_model=config.get('pretrained_model', 'bert-base-chinese'),
+            precomputed_embeddings=precomputed_embeddings,
+            id_dim=config.get('model_id_dim', config.get('id_dim', 128)),
+            llm_proj_dim=config.get('model_llm_proj_dim', config.get('llm_proj_dim', 256)),
+            llm_inter_dim=config.get('model_llm_inter_dim', config.get('llm_inter_dim', 512)),
+            id_dropout_rate=config.get('model_id_dropout_rate', config.get('id_dropout_rate', 0.15)),
+            lambda_contra=config.get('llm_lambda_contra', config.get('lambda_contra', 0.3)),
+            contrast_temperature=config.get('llm_contrast_temperature', config.get('contrast_temperature', 0.07)),
+            use_gnn=config.get('use_gnn', False),
+            n_kc=final_n_kc,
+            gnn_layers=config.get('gnn_gnn_layers', config.get('gnn_layers', 2)),
+        )
+        print(f"✅ 模型创建完成，实际 n_kc={model.n_kc}")
 
     # 分支激活报告：避免配置开启但链路未生效
     llm_enabled = bool(config.get('use_llm', False))
@@ -735,6 +750,9 @@ def main():
 
     amp_flag = config.get('use_amp', config.get('training_use_amp', True))
     use_amp = bool(amp_flag) and str(device).startswith('cuda')
+    # 基线模型禁用 AMP（fp16 溢出问题）
+    if baseline_name:
+        use_amp = False
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     print(f"⚙️  AMP混合精度: {'开启' if use_amp else '关闭'}")
 

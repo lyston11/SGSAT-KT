@@ -149,3 +149,52 @@ presets:
     gnn:
       gnn_layers: 3
       use_gnn: true
+
+  # 基线对比模型（论文实验用）
+  sakt:
+    training:
+      batch_size: 32
+      n_epochs: 100
+      early_stop: 5
+    llm:
+      use_llm: false
+    gnn:
+      use_gnn: false
+    model:
+      _baseline: sakt
+
+  akt:
+    training:
+      batch_size: 32
+      n_epochs: 100
+      early_stop: 5
+    llm:
+      use_llm: false
+    gnn:
+      use_gnn: false
+    model:
+      _baseline: akt
+
+  dkt:
+    training:
+      batch_size: 32
+      n_epochs: 100
+      early_stop: 5
+    llm:
+      use_llm: false
+    gnn:
+      use_gnn: false
+    model:
+      _baseline: dkt
+
+  dkvmn:
+    training:
+      batch_size: 32
+      n_epochs: 100
+      early_stop: 5
+    llm:
+      use_llm: false
+    gnn:
+      use_gnn: false
+    model:
+      _baseline: dkvmn

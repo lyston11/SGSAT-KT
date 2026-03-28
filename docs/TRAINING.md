@@ -119,6 +119,10 @@ loss = weighted_BCE + lambda_cl * sequence_CL + lambda_contra * embedding_InfoNC
 | `baseline` | `./scripts/2_train.sh baseline` | 基线 | OFF | OFF | OFF | 100 |
 | `full` | `./scripts/2_train.sh full` | 完整模型 | ON | ON | ON | 30 |
 | `prod` | `./scripts/2_train.sh prod` | 生产环境 | ON | ON | OFF | 200 |
+| `sakt` | `./scripts/2_train.sh sakt` | SAKT 基线 | OFF | OFF | OFF | 100 |
+| `akt` | `./scripts/2_train.sh akt` | AKT 基线 | OFF | OFF | OFF | 100 |
+| `dkt` | `./scripts/2_train.sh dkt` | DKT 基线 | OFF | OFF | OFF | 100 |
+| `dkvmn` | `./scripts/2_train.sh dkvmn` | DKVMN 基线 | OFF | OFF | OFF | 100 |
 
 ## 调参
 

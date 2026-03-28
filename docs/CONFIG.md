@@ -91,6 +91,10 @@ presets:
   baseline:  # 基线模型（100轮，无LLM/GNN）
   full:      # 完整模型（100轮，LLM+GNN）
   prod:      # 生产环境（200轮，最佳性能）
+  sakt:      # SAKT 基线（100轮）
+  akt:       # AKT 基线（100轮）
+  dkt:       # DKT 基线（100轮）
+  dkvmn:     # DKVMN 基线（100轮）
 ```
 
 使用方式：
@@ -307,6 +311,10 @@ output/
 ./scripts/train.sh baseline  # 基线
 ./scripts/train.sh full      # 完整
 ./scripts/train.sh prod      # 生产
+./scripts/train.sh sakt      # SAKT 基线
+./scripts/train.sh akt       # AKT 基线
+./scripts/train.sh dkt       # DKT 基线
+./scripts/train.sh dkvmn     # DKVMN 基线
 ```
 
 ## 📞 需要帮助？

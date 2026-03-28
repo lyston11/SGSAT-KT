@@ -247,7 +247,7 @@ class SAKT(nn.Module):
         s_emb = self.s_embed(s) + q_emb
 
         seq_len = q.size(1)
-        mask = future_mask(seq_len, self.device)
+        mask = future_mask(seq_len, q.device)
 
         h = self.forward(q_emb, s_emb, mask)
 
