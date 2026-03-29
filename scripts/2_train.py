@@ -693,11 +693,15 @@ def main():
     else:
         print("  CL损失已启用：训练将调用 get_cl_loss")
 
-    # 优化器
+    # 优化器 + Cosine Annealing 调度器
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.get('learning_rate', 0.001),
         weight_decay=config.get('training_l2', config.get('l2', 1e-5))
+    )
+    epochs = config.get('epochs', config.get('n_epochs', 30))
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=config.get('learning_rate', 0.001) * 0.01
     )
 
     # 设置设备和多GPU
@@ -826,6 +830,11 @@ def main():
         if early_stop > 0 and epoch - best_epoch >= early_stop:
             print(f"⏸️  早停触发 (Best: Epoch {best_epoch})")
             break
+
+        # Cosine Annealing: 更新学习率
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"📐 学习率: {current_lr:.6f}")
 
     print(f"\n{'='*60}")
     print(f"🎉 训练完成!")

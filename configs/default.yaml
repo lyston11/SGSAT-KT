@@ -8,7 +8,7 @@ model:
   d_fc: 512
   n_heads: 8
   n_layers: 2
-  n_know: 32
+  n_know: 64
   dropout: 0.2
   window: 1
   id_dim: 128           # ID embedding 固定维度

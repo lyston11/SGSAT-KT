@@ -434,6 +434,13 @@ class DTransformer(nn.Module):
         if use_gnn:
             self.gnn = GNNPrerequisiteGraph(n_kc, d_model, gnn_layers, dropout)
 
+        # Embedding 层 dropout（正则化）
+        self.emb_dropout = nn.Dropout(dropout)
+
+        # 遗忘机制：重复次数嵌入
+        self.max_repeats = 20
+        self.repeat_embed = nn.Embedding(self.max_repeats, d_model)
+
         self.n_heads = n_heads
         self.block1 = DTransformerLayer(d_model, n_heads, dropout)
         self.block2 = DTransformerLayer(d_model, n_heads, dropout)
@@ -466,6 +473,41 @@ class DTransformer(nn.Module):
         self.shortcut = shortcut
         self.n_layers = n_layers
         self.window = window
+
+        # 位置编码（sinusoidal，不可学习）
+        self._build_positional_encoding(d_model, max_len=512)
+
+    def _build_positional_encoding(self, d_model, max_len=512):
+        """构建 sinusoidal 位置编码 (Vaswani et al., 2017)"""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pos_pe', pe)  # (max_len, d_model)
+
+    def _add_positional_encoding(self, x):
+        """给序列添加位置编码, x: (batch, seq_len, d_model)"""
+        seq_len = x.size(1)
+        return x + self.pos_pe[:seq_len].unsqueeze(0)
+
+    def _compute_repeat_counts(self, q):
+        """计算每个位置题目的重复出现次数（遗忘信号）。
+
+        q: (batch, seq_len)，题目ID序列（已将负值填充为0）
+        返回: (batch, seq_len) 的 long tensor，每个位置记录该题目前面已出现几次+1
+        """
+        B, L = q.size()
+        counts = torch.ones(B, L, device=q.device, dtype=torch.long)
+        for b in range(B):
+            seen = {}
+            for t in range(L):
+                qid = q[b, t].item()
+                counts[b, t] = seen.get(qid, 0) + 1
+                seen[qid] = counts[b, t]
+        return counts
 
     def forward(self, q_emb, s_emb, lens, need_scores=False):
         if self.shortcut:
@@ -570,6 +612,16 @@ class DTransformer(nn.Module):
         if self.use_gnn and kc_ids is not None and edge_index is not None:
             prereq_emb = self.gnn(edge_index, kc_ids)
             q_emb = q_emb + prereq_emb  # 按文档要求：直接相加
+
+        # Embedding dropout（正则化，仅训练时）
+        if self.training:
+            q_emb = self.emb_dropout(q_emb)
+            s_emb = self.emb_dropout(s_emb)
+
+        # 遗忘机制：重复次数嵌入（q 中同一题目出现的累计次数）
+        repeat_counts = self._compute_repeat_counts(q)  # (B, L)
+        repeat_emb = self.repeat_embed(repeat_counts.clamp(max=self.max_repeats - 1))
+        q_emb = q_emb + repeat_emb
 
         return q_emb, s_emb, lens, p_diff
 
