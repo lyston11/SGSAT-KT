@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v3.0** — 门控融合 + 辅助 InfoNCE 对比损失
+**v3.1** — 基座模型优化: n_know=64 + cosine annealing + 重复次数嵌入
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -14,10 +14,12 @@
 | id_dim | 128 (ID embedding 固定) |
 | llm_proj_dim | 256 (LLM 投影目标) |
 | llm_inter_dim | 512 (LLM 中间投影) |
-| id_dropout_rate | 0.15 (v3.0 新增) |
-| lambda_contra | 0.3 (v3.0 新增) |
-| contrast_temperature | 0.07 (v3.0 新增) |
-| 知识组件数 | 32 |
+| id_dropout_rate | 0.15 |
+| lambda_contra | 0.3 |
+| contrast_temperature | 0.07 |
+| 知识组件数 | 64 (v3.1: 32→64) |
+| 重复嵌入 | max_repeats=20 (v3.1 新增) |
+| 学习率调度 | Cosine Annealing (v3.1 新增) |
 | 注意力头数 | 8 |
 
 ## 两段式训练
@@ -80,7 +82,7 @@ Block2: cross-attention(Q=q_emb, V=s_emb) — 题目-作答交叉注意力
 ### 知识组件发现
 
 ```
-know_params [32, 256]  →  expand  →  Block4 cross-attn(know→hidden)  →  z [B,L,8192]
+know_params [64, 256]  →  expand  →  Block4 cross-attn(know→hidden)  →  z [B,L,16384]
 ```
 
 ### 预测头
@@ -153,7 +155,13 @@ gnn:
 
 ## 版本历史
 
-### v3.0 (当前)
+### v3.1 (当前)
+- n_know 扩容: 32→64，匹配 xes 数据集 812 个知识点的表达需求
+- Cosine Annealing 学习率调度: 替代固定 lr，后期更稳定
+- Embedding dropout: q_emb/s_emb 在送入 Transformer 前施加 dropout
+- 重复次数嵌入: 通过同一题目累计出现次数建模遗忘/强化信号
+
+### v3.0
 - 门控融合: `sigmoid(W_g · llm) * llm + Linear(id)` 替代 concat+project
 - 辅助 InfoNCE 对比损失: 强制 LLM 投影空间结构化
 - ID Dropout (p=0.15): 训练时随机置零 ID，迫使模型依赖 LLM

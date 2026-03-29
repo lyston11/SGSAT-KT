@@ -133,11 +133,19 @@ recommendation:
 ```yaml
 model:
   id_dropout_rate: 0.15    # ID embedding dropout 概率（迫使模型依赖 LLM）
+  n_know: 64               # 知识组件数量（v3.1: 32→64）
 
 llm:
   lambda_contra: 0.3          # 辅助嵌入对比损失权重
   contrast_temperature: 0.07  # InfoNCE 温度
 ```
+
+### v3.1 基座模型优化
+
+- `n_know: 32→64`: 知识组件扩容，匹配 xes 数据集 ~812 个知识点
+- Cosine Annealing 学习率调度: 自动配置，无需手动设置
+- 重复次数嵌入: `max_repeats=20`，建模题目重复出现次数（遗忘/强化信号）
+- Embedding dropout: 训练时对 q_emb/s_emb 施加 dropout 正则化
 
 ## 🚀 使用方法
 
