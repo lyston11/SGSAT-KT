@@ -1,7 +1,7 @@
 """
-预计算嵌入加载器（v3: 门控融合 + 辅助 InfoNCE 对比损失）
-加载离线预计算的 Qwen 语义嵌入，通过门控机制动态融合 ID/LLM 信号，
-并施加辅助对比损失强制 LLM 投影空间保持结构化。
+预计算嵌入加载器（v4: Cross-Attention 融合 + 辅助 InfoNCE 对比损失）
+ID embedding 作为 Query 主动 attend LLM 语义特征，提取 task-specific 信号，
+通过门控残差防止 attention 坍塌，并保留辅助对比损失。
 """
 import os
 import pickle
@@ -206,17 +206,21 @@ class PrecomputedEmbeddingLayer(nn.Module):
 
 class LLMGroundingWithPrecomputed(nn.Module):
     """
-    结合ID嵌入和预计算LLM语义嵌入的混合嵌入模块（v3: 门控融合 + 辅助对比损失）
+    结合ID嵌入和预计算LLM语义嵌入的混合嵌入模块（v4: Cross-Attention 融合）
 
-    v3.0 改动:
-    - 门控融合: sigmoid(W_g · llm_emb) * llm_emb + Linear(id_emb)
+    v4.0 改动:
+    - Cross-Attention: ID 作为 Query 主动 attend LLM 特征，提取 task-specific 语义
+    - 门控残差: 2层 gate network 输出标量，防止 attention 坍塌
     - ID Dropout: 训练时以 p=0.15 将 ID 嵌入置零，迫使模型依赖 LLM
-    - 辅助 InfoNCE: 在 LLM 投影空间施加对比损失，防止门控退化为零
+    - 辅助 InfoNCE: 在 LLM 投影空间施加对比损失
 
     维度流:
-      id_emb [B,L,128] → id_to_llm_proj → [B,L,256]
-      llm_emb [B,L,256] → gate(sigmoid) → gated_llm [B,L,256]
-      combined = LN(gated_llm + id_to_llm_proj(id_emb)) → [B,L,256] = d_model
+      id_emb [B,L,128] → id_to_llm_proj → [B,L,256]  (Query)
+      llm_emb [B,L,256]                                (Key, Value)
+      cross_attn(Q=id_proj, K=llm, V=llm) → attn_out [B,L,256]
+      gate_val = gate_net(attn_out) → [B,L,1]
+      fused = gate * attn_out + (1-gate) * id_proj → [B,L,256]
+      output = LayerNorm(fused) → [B,L,256] = d_model
     """
     def __init__(
         self,
@@ -228,6 +232,8 @@ class LLMGroundingWithPrecomputed(nn.Module):
         precomputed_embeddings=None,
         use_llm=True,
         id_dropout_rate=0.15,
+        num_heads=4,
+        dropout=0.1,
     ):
         super().__init__()
         self.use_llm = use_llm
@@ -247,23 +253,36 @@ class LLMGroundingWithPrecomputed(nn.Module):
                 use_llm=True,
             )
 
-            # v3: ID → LLM 维度投影（128 → 256），用于同维度融合
+            # ID → LLM 维度投影（128 → 256），用于 Query
             self.id_to_llm_proj = nn.Linear(id_dim, llm_proj_dim)
 
-            # v3: 门控网络
-            self.gate_linear = nn.Linear(llm_proj_dim, llm_proj_dim)
+            # v4: Cross-Attention（ID Query → attend LLM Key/Value）
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=llm_proj_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
 
-            # v3: ID Dropout
+            # v4: 门控网络（2层→标量，防止 attention 坍塌）
+            self.gate = nn.Sequential(
+                nn.Linear(llm_proj_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1),
+                nn.Sigmoid(),
+            )
+
+            # ID Dropout
             self.id_dropout = nn.Dropout(p=id_dropout_rate)
 
-            # v3: 融合后 LayerNorm（输出 llm_proj_dim = d_model）
+            # 融合后 LayerNorm（输出 llm_proj_dim = d_model）
             self.fusion_norm = nn.LayerNorm(llm_proj_dim)
 
-            # v3: 对比损失投影头（降维到 128 加速计算）
+            # 对比损失投影头（降维到 128 加速计算）
             self.contrast_head = nn.Linear(llm_proj_dim, 128)
 
-            print(f"✅ 使用门控融合+对比损失(v3): id_dim={id_dim}, llm_proj_dim={llm_proj_dim}, "
-                  f"id_dropout={id_dropout_rate}")
+            print(f"✅ Cross-Attention融合+对比损失(v4): id_dim={id_dim}, llm_proj_dim={llm_proj_dim}, "
+                  f"num_heads={num_heads}, id_dropout={id_dropout_rate}")
         else:
             self.llm_layer = None
             # 无 LLM 时直接投影 ID 到 d_model
@@ -280,22 +299,38 @@ class LLMGroundingWithPrecomputed(nn.Module):
         id_emb = self.q_embed(q_ids)  # (batch, seq_len, id_dim)
 
         if not self.use_llm or self.llm_layer is None:
-            # 无 LLM 时: 投影 ID 到 d_model
             return self.id_proj(id_emb)
 
-        # v3: ID Dropout（仅训练时）
+        # ID Dropout（仅训练时）
         if self.training:
             id_emb = self.id_dropout(id_emb)
 
         # 获取预计算的 LLM 嵌入 (batch, seq_len, llm_proj_dim)
         llm_emb = self.llm_layer(q_ids, kc_ids)
 
-        # v3: 门控融合
-        id_proj = self.id_to_llm_proj(id_emb)               # [B, L, llm_proj_dim]
-        gate_val = torch.sigmoid(self.gate_linear(llm_emb))  # [B, L, llm_proj_dim]
-        gated_llm = gate_val * llm_emb                       # [B, L, llm_proj_dim]
-        combined = self.fusion_norm(gated_llm + id_proj)     # [B, L, llm_proj_dim] = d_model
-        return combined
+        # ID 投影到 LLM 维度 → 作为 Query
+        id_proj = self.id_to_llm_proj(id_emb)  # [B, L, llm_proj_dim]
+
+        # Causal mask（KT 不能看未来位置）
+        seq_len = q_ids.size(1)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=q_ids.device), diagonal=1
+        ).bool()
+
+        # Cross-Attention: ID Query → attend LLM Key/Value
+        attn_output, _ = self.cross_attn(
+            query=id_proj,
+            key=llm_emb,
+            value=llm_emb,
+            attn_mask=causal_mask,
+            need_weights=False,
+        )  # [B, L, llm_proj_dim]
+
+        # 门控残差融合
+        gate_val = self.gate(attn_output)  # [B, L, 1]
+        fused = gate_val * attn_output + (1 - gate_val) * id_proj  # [B, L, llm_proj_dim]
+
+        return self.fusion_norm(fused)  # [B, L, llm_proj_dim] = d_model
 
     def compute_contrastive_loss(self, q_ids, kc_ids=None, temperature=0.07):
         """

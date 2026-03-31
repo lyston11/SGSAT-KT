@@ -15,11 +15,13 @@ echo "模式: $MODE"
 echo "📄 日志文件: $LOG_FILE"
 echo ""
 
-# 检查预计算嵌入
-if [ ! -f "data/embeddings/question_embeddings.pkl" ]; then
-    echo "⚠️  预计算嵌入不存在"
-    echo "请先运行: ./scripts/1_precompute.sh"
-    exit 1
+# 检查预计算嵌入（仅 LLM 相关模式需要）
+if [ "$MODE" != "test" ] && [ "$MODE" != "baseline" ] && [ "$MODE" != "sakt" ] && [ "$MODE" != "akt" ] && [ "$MODE" != "dkt" ] && [ "$MODE" != "dkvmn" ]; then
+    if [ ! -f "data/embeddings/question_embeddings.pkl" ]; then
+        echo "⚠️  预计算嵌入不存在"
+        echo "请先运行: ./scripts/1_precompute.sh"
+        exit 1
+    fi
 fi
 
 # 运行训练，同时输出到终端和日志文件

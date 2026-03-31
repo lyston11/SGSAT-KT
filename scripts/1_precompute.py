@@ -152,12 +152,20 @@ def main():
     print(f"📌 使用本地模型目录: {resolved_model_path}")
     generator = QwenEmbeddingGenerator(model_path=resolved_model_path)
 
+    # 确定数据集（从配置或命令行参数）
+    import sys
+    dataset_name = cfg.get('training', {}).get('dataset', 'xes')
+    if len(sys.argv) > 1:
+        dataset_name = sys.argv[1]
+
+    print(f"📊 目标数据集: {dataset_name}")
+
     # 加载文本数据
     print("\n📂 加载文本数据...")
     data_dir = os.path.join(project_root, "data/text_data")
 
-    q_file = os.path.join(data_dir, "xes_question_texts.json")
-    kc_file = os.path.join(data_dir, "xes_kc_texts.json")
+    q_file = os.path.join(data_dir, f"{dataset_name}_question_texts.json")
+    kc_file = os.path.join(data_dir, f"{dataset_name}_kc_texts.json")
 
     if os.path.exists(q_file):
         with open(q_file, 'r', encoding='utf-8') as f:

@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from DTransformer.embedding_loader import LLMGroundingWithPrecomputed
 
 MIN_SEQ_LEN = 5
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ============ 修改点1: LLM语义Grounding模块 ============
@@ -248,10 +247,10 @@ class GNNPrerequisiteGraph(nn.Module):
 
 # ============ 修改点3: 图增强DCF-Sim相似度 ============
 class DCFSimGraphEnhanced:
-    """动态认知融合相似度（图增强版）
+    """动态认知融合相似度（图增强版）— 后处理工具类
 
-    原DCF-Sim: sim = 0.5*cos + 0.3*diff_sim + 0.2*anomaly
-    修改后（按文档要求）: sim(u,v) = 0.5*cos + 0.25*diff_sim + 0.15*anomaly + 0.1*graph_path_sim
+    用于训练后的用户相似度分析和推荐，不参与模型训练循环。
+    公式: sim(u,v) = 0.5*cos + 0.25*diff_sim + 0.15*anomaly + 0.1*graph_path_sim
     """
     def __init__(self, n_users, n_questions, half_life=20):
         self.n_users = n_users
@@ -346,7 +345,7 @@ class DTransformer(nn.Module):
     三大创新点整合:
     - 修改点1: LLM语义Grounding (embedding层)
     - 修改点2: GNN Prerequisite Graph (输入特征)
-    - 修改点3: Graph-Enhanced DCF-Sim (相似度计算)
+    - 修改点3: Graph-Enhanced DCF-Sim (后处理相似度分析工具)
     
     继承汪盈2025硕士论文SATKT主干结构，代码改动量<25%
     """
@@ -376,6 +375,7 @@ class DTransformer(nn.Module):
         id_dropout_rate=0.15,
         lambda_contra=0.3,
         contrast_temperature=0.07,
+        cross_attn_heads=4,
         # ============ 修改点2参数: GNN先决图 ============
         n_kc=100,
         use_gnn=False,
@@ -405,6 +405,8 @@ class DTransformer(nn.Module):
                     precomputed_embeddings=precomputed_embeddings,
                     use_llm=True,
                     id_dropout_rate=id_dropout_rate,
+                    num_heads=cross_attn_heads,
+                    dropout=dropout,
                 )
                 self.use_precomputed_llm = True
             else:
@@ -585,12 +587,24 @@ class DTransformer(nn.Module):
             # 使用LLMGroundingWithID
             q_emb = self.q_embed(q, q_text_input, kc_text_input)
         elif self.use_llm:
-            # 仅使用ID嵌入部分
-            q_emb = self.q_embed.q_embed(q)
+            # LLM 全部不可用，退化为 ID 投影（128→256）
+            id_emb = self.q_embed.q_embed(q)  # [B, L, 128]
+            q_emb = self.q_embed.id_to_llm_proj(id_emb)  # [B, L, 256]
         else:
             # 原SATKT嵌入
             q_emb = self.q_embed(q)
 
+        # ============ 修改点2: 加入GNN先决图嵌入 ============
+        if self.use_gnn and kc_ids is not None and edge_index is not None:
+            prereq_emb = self.gnn(edge_index, kc_ids)
+            q_emb = q_emb + prereq_emb
+
+        # 遗忘机制：重复次数嵌入（q 中同一题目出现的累计次数）
+        repeat_counts = self._compute_repeat_counts(q)  # (B, L)
+        repeat_emb = self.repeat_embed(repeat_counts.clamp(max=self.max_repeats - 1))
+        q_emb = q_emb + repeat_emb
+
+        # s_emb 在所有 q_emb 增强完成后构造，确保包含 GNN 和 repeat 特征
         s_emb = self.s_embed(s) + q_emb
 
         p_diff = 0.0
@@ -605,23 +619,10 @@ class DTransformer(nn.Module):
             s_diff_emb = self.s_diff_embed(s) + q_diff_emb
             s_emb += s_diff_emb * p_diff
 
-        # ============ 修改点2: 加入GNN先决图嵌入 ============
-        # 文档要求: input_emb = q_emb + prereq_emb + time_emb
-        # 原SATKT: input_emb = q_emb + time_emb
-        # 修改后: 直接相加，而非加权平均
-        if self.use_gnn and kc_ids is not None and edge_index is not None:
-            prereq_emb = self.gnn(edge_index, kc_ids)
-            q_emb = q_emb + prereq_emb  # 按文档要求：直接相加
-
         # Embedding dropout（正则化，仅训练时）
         if self.training:
             q_emb = self.emb_dropout(q_emb)
             s_emb = self.emb_dropout(s_emb)
-
-        # 遗忘机制：重复次数嵌入（q 中同一题目出现的累计次数）
-        repeat_counts = self._compute_repeat_counts(q)  # (B, L)
-        repeat_emb = self.repeat_embed(repeat_counts.clamp(max=self.max_repeats - 1))
-        q_emb = q_emb + repeat_emb
 
         return q_emb, s_emb, lens, p_diff
 
@@ -685,12 +686,30 @@ class DTransformer(nn.Module):
         z_norm = F.normalize(z, p=2, dim=1)
         return torch.mm(z_norm, z_norm.transpose(0, 1))
 
-    def knowledge_consistency_loss(self, z, consistency_weight=0.5):
+    def knowledge_consistency_loss(self, z, lens=None, consistency_weight=0.5):
         batch_size, seq_len, feature_size = z.size()
-        z_viewed = z.view(-1, feature_size)
-        sim_matrix = self.efficient_cosine_similarity(z_viewed)
-        mask = torch.eye(batch_size * seq_len, device=z.device)
-        loss = (sim_matrix - mask).pow(2).sum() / (batch_size * seq_len * (batch_size * seq_len - 1))
+
+        if lens is not None:
+            # 只用真实序列长度内的位置，过滤 padding
+            valid_z = []
+            for b in range(batch_size):
+                valid_z.append(z[b, :lens[b], :])
+            z_valid = torch.cat(valid_z, dim=0)  # (sum(lens), feature_size)
+            n = z_valid.size(0)
+            if n < 2:
+                return torch.tensor(0.0, device=z.device)
+            z_norm = F.normalize(z_valid, p=2, dim=1)
+            sim_matrix = torch.mm(z_norm, z_norm.transpose(0, 1))
+            mask = torch.eye(n, device=z.device)
+            loss = (sim_matrix - mask).pow(2).sum() / (n * (n - 1))
+        else:
+            z_viewed = z.view(-1, feature_size)
+            n = z_viewed.size(0)
+            z_norm = F.normalize(z_viewed, p=2, dim=1)
+            sim_matrix = torch.mm(z_norm, z_norm.transpose(0, 1))
+            mask = torch.eye(n, device=z.device)
+            loss = (sim_matrix - mask).pow(2).sum() / (n * (n - 1))
+
         return consistency_weight * loss
 
     def compute_embedding_contrastive_loss(self, q, kc_ids=None):
@@ -719,7 +738,8 @@ class DTransformer(nn.Module):
         masked_logits = logits[s >= 0]
 
         bce_loss = self.weighted_bce_loss(masked_logits, masked_labels, neg_weight)
-        cons_loss = self.knowledge_consistency_loss(z, consistency_weight)
+        lens = (s >= 0).sum(dim=1)
+        cons_loss = self.knowledge_consistency_loss(z, lens=lens, consistency_weight=consistency_weight)
 
         total_loss = bce_loss + cons_loss + reg_loss
 

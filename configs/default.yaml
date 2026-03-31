@@ -1,9 +1,9 @@
 # SGSAT-KT Default Configuration
 # 默认配置文件
+# 注意：只列出实际生效的配置项。每个键都会被训练脚本读取并传递给模型。
 
 # Model Settings
 model:
-  name: "DTransformer"
   d_model: 256
   d_fc: 512
   n_heads: 8
@@ -15,14 +15,13 @@ model:
   llm_proj_dim: 256     # LLM 投影目标维度
   llm_inter_dim: 512    # LLM 中间投影维度
   id_dropout_rate: 0.15 # ID embedding dropout 概率（迫使模型依赖 LLM 信号）
+  cross_attn_heads: 4   # Cross-Attention 头数（v4.0: ID Query attend LLM）
 
 # Innovation 1: LLM Semantic Grounding
 llm:
   use_llm: true
-  llm_weight: 0.3
   pretrained_model: "pretrained_models/qwen3-4b"
   freeze_bert: true
-  max_seq_length: 512
   lambda_contra: 0.3          # 辅助对比损失权重（v3.0）
   contrast_temperature: 0.07  # InfoNCE 温度（v3.0）
 
@@ -31,20 +30,16 @@ gnn:
   use_gnn: true
   n_kc: 100
   gnn_layers: 2
-  graph_weight: 0.3
-  dropout: 0.1
 
-# Innovation 3: Graph-Enhanced DCF-Sim
+# Innovation 3: 对比学习 + DCF-Sim 后处理工具
 recommendation:
-  use_graph_similarity: false
-  graph_weight: 0.1
+  use_graph_similarity: false  # DCFSimGraphEnhanced 标记（后处理工具，不影响训练）
   cl_loss: false
   lambda_cl: 0.1
 
 # 预计算嵌入配置
 precomputed:
   use_precomputed: true  # Qwen3预计算嵌入
-  embeddings_dir: "data/embeddings"
 
 # Training Settings
 training:
@@ -60,41 +55,9 @@ training:
   dataset: "xes"  # 默认数据集
   gradient_accumulation_steps: 2  # 梯度累积，模拟batch_size=32
 
-# GPU Settings
+# GPU Settings（自动选最空闲的单 GPU，DataParallel 对当前模型无效）
 gpu:
-  # GPU设备ID列表 (例如: [0, 1, 2, 3])
-  # 设为 null 则使用所有可用GPU
-  device_ids: [0, 1]
-
-  # 主GPU (用于多GPU训练)
-  primary_gpu: 0
-
-  # 是否使用DataParallel (简单多GPU)
-  use_data_parallel: true
-
-# Data Settings
-data:
-  dataset_dir: "data"
-  datasets:
-    - assist09
-    - assist17
-    - statics
-    - algebra05
-    - doudouyun
-
-# Output Settings
-output:
-  output_dir: "output"
-  log_interval: 10
-  save_interval: 5
-
-# Evaluation Settings
-evaluation:
-  metrics:
-    - auc
-    - acc
-    - mae
-    - rmse
+  device_ids: [0, 1]  # 候选 GPU 列表，训练时自动选最空闲的
 
 # =================== 预设配置 ===================
 # 快速切换训练模式，所有参数都可以在这里修改
@@ -124,8 +87,8 @@ presets:
   # 完整模型（LLM + GNN）
   full:
     training:
-      batch_size: 8   # d_model=256 后每卡只能4，梯度累积4步=有效batch 32
-      gradient_accumulation_steps: 4
+      batch_size: 4   # d_model=256 + n_know=64, 12GB GPU 实际只能4
+      gradient_accumulation_steps: 8  # 梯度累积8步=有效batch 32
       n_epochs: 30
       early_stop: 999  # 禁用早停，跑满30轮
     llm:

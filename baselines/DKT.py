@@ -21,7 +21,7 @@ class DKT(nn.Module):
             torch.cat([pad_start, x], dim=1),
             h0,
         )
-        res = torch.sigmoid(self.fc(out))[:, :-1, :]
+        res = self.fc(out)[:, :-1, :]
         return res
 
     def predict(self, q, s, pid=None, n=1):

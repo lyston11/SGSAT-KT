@@ -27,36 +27,27 @@
 
 ## 🎮 GPU 配置
 
-### 1️⃣ 单GPU训练（默认）
-
-编辑 `configs/default.yaml`：
+### 单GPU训练
 
 ```yaml
 gpu:
-  device_ids: null  # null表示自动使用所有可用GPU
-  primary_gpu: 0
-  use_data_parallel: false
+  device_ids: [0]  # 只使用GPU 0
 ```
 
-### 2️⃣ 多GPU训练
+### 多GPU训练（DataParallel）
 
-指定使用哪些GPU（例如使用GPU 0, 1, 2, 3）：
+多GPU 由 `device_ids` 长度自动决定，列出 2 个以上即启用：
 
 ```yaml
 gpu:
-  device_ids: [0, 1, 2, 3]  # 使用4块GPU
-  primary_gpu: 0            # 主GPU
-  use_data_parallel: true   # 启用DataParallel
+  device_ids: [0, 1]  # 使用GPU 0和1，自动启用DataParallel
 ```
 
-### 3️⃣ 特定GPU
-
-只使用GPU 1和2：
+### 特定GPU
 
 ```yaml
 gpu:
-  device_ids: [1, 2]
-  primary_gpu: 1
+  device_ids: [1, 2]  # 只使用GPU 1和2
 ```
 
 ## 🤖 LLM 模型配置
@@ -99,6 +90,7 @@ presets:
 
 使用方式：
 ```bash
+conda activate lyston
 ./scripts/train.sh full   # 自动应用 full 预设的配置
 ```
 
@@ -124,7 +116,7 @@ gnn:
   use_gnn: true          # 是否使用GNN
 
 recommendation:
-  use_graph_similarity: true  # 是否使用图相似度
+  use_graph_similarity: false  # DCFSimGraphEnhanced 标记（后处理工具，不影响训练）
   cl_loss: true              # 是否使用对比损失
 ```
 
@@ -146,6 +138,28 @@ llm:
 - Cosine Annealing 学习率调度: 自动配置，无需手动设置
 - 重复次数嵌入: `max_repeats=20`，建模题目重复出现次数（遗忘/强化信号）
 - Embedding dropout: 训练时对 q_emb/s_emb 施加 dropout 正则化
+
+### v4.0 项目缺陷修复
+
+- `cross_attn_heads` 配置现已正确传递到模型（之前硬编码为 4）
+- `freeze_bert` 配置现已正确传递到模型
+- `n_know` 默认值统一为 64（之前三处不一致: yaml=64, 脚本 fallback=32, 模型 default=16）
+- 删除无效配置项: `model.name`, `llm.llm_weight`, `llm.max_seq_length`, `gnn.graph_weight`, `gnn.dropout`, `gpu.primary_gpu`, `gpu.use_data_parallel`, `data.*`, `output.*`, `evaluation.*`
+- 修复 shell 脚本: test/baseline 等非 LLM 模式不再要求 embedding 文件
+- 修复在线 LLM fallback 路径: `prepare_bert_inputs` 在 list 包装前调用
+- 修复 LLM→ID fallback 维度不匹配: 退化为 `id_to_llm_proj(id_emb)` 输出 256 维
+- 修复预计算嵌入检查: `use_precomputed` 检查增加 `use_llm` 守卫，非 LLM 模式不检查
+- 预计算脚本支持数据集参数: `python scripts/1_precompute.py [dataset]`，默认从 config 读取
+- DCFSimGraphEnhanced 标注为后处理工具类，不参与训练循环
+- pyproject.toml 依赖版本对齐 requirements.txt，修复拼写错误
+- 清理 config_loader.py 死代码 (TrainingConfig 类)
+- Makefile: `make test` → pytest 单测，新增 `make smoke-test` 训练冒烟测试
+
+### v4.0 Cross-Attention 融合
+
+- `cross_attn_heads: 4`: Cross-Attention 头数，ID embedding 作为 Query attend LLM 语义特征
+- 门控残差: 2 层 gate network 输出标量，防止 attention 坍塌
+- Causal Mask: 保持 KT 自回归特性
 
 ## 🚀 使用方法
 

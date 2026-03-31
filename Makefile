@@ -5,7 +5,8 @@ help:
 	@echo "SGSAT-KT Makefile Commands:"
 	@echo "  make install     - Install dependencies"
 	@echo "  make train       - Run training with default settings"
-	@echo "  make test        - Run tests"
+	@echo "  make test        - Run unit tests (pytest)"
+	@echo "  make smoke-test  - Quick training smoke test"
 	@echo "  make clean       - Clean output files"
 	@echo "  make format      - Format Python code"
 	@echo "  make lint        - Run linting"
@@ -26,9 +27,14 @@ train-full:
 	@echo "Starting full SGSAT-KT training..."
 	./scripts/2_train.sh full
 
-# Test with small dataset
+# Unit tests
 test:
-	@echo "Running tests..."
+	@echo "Running unit tests..."
+	python -m pytest DTransformer/tests/ -v
+
+# Quick smoke test (training script in test mode)
+smoke-test:
+	@echo "Running smoke test..."
 	./scripts/2_train.sh test
 
 # Clean outputs

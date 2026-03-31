@@ -209,13 +209,14 @@ def load_edge_index(dataset_name, data_dir, device):
     return edge_index, max_kc_id
 
 
-def load_precomputed_embeddings(data_dir, use_gnn=False):
+def load_precomputed_embeddings(data_dir, use_gnn=False, use_llm=False):
     """加载预计算嵌入对象"""
     emb_dir = os.path.join(data_dir, "embeddings")
     precomputed = PrecomputedEmbeddings(embedding_dir=emb_dir)
 
     precomputed.load_question_embeddings()
-    if use_gnn:
+    # KC embeddings: GNN 和 LLM 融合（e_q + W_p(e_kc)）都需要
+    if use_gnn or use_llm:
         try:
             precomputed.load_kc_embeddings()
         except FileNotFoundError:
@@ -253,14 +254,14 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
             q, s = batch.get("q", "s")
             pid = None
 
-        # 如果 seq_len 为 None，需要包装成 list
-        if seq_len is None:
-            q, s, pid = [q], [s], [pid]
-
-        # 准备LLM文本输入
+        # 准备LLM文本输入（需要在 list 包装前调用，prepare_bert_inputs 需要 tensor）
         q_text_input = None
         if config.get('use_llm', False) and q_texts is not None:
             q_text_input = prepare_bert_inputs(q_texts, q, tokenizer)
+
+        # 如果 seq_len 为 None，需要包装成 list
+        if seq_len is None:
+            q, s, pid = [q], [s], [pid]
 
         # 准备GNN输入 / LLM对比损失输入
         kc_ids = None
@@ -382,15 +383,15 @@ def validate(model, valid_data, config, q_texts=None, tokenizer=None,
                 q, s = batch.get("q", "s")
                 pid = None
 
-            # 如果 seq_len 为 None，需要包装成 list
-            if seq_len is None:
-                q, s, pid = [q], [s], [pid]
-
-            # 准备输入（同训练）
+            # 准备输入（同训练）— LLM 输入需要在 list 包装前准备
             q_text_input = None
             if config.get('use_llm', False) and q_texts is not None:
                 q_text_input = prepare_bert_inputs(q_texts, q, tokenizer)
-                if seq_len is None:
+
+            # 如果 seq_len 为 None，需要包装成 list
+            if seq_len is None:
+                q, s, pid = [q], [s], [pid]
+                if q_text_input is not None:
                     q_text_input = [q_text_input]
 
             kc_ids = None
@@ -489,8 +490,8 @@ def main():
     print(f"  GPU设备: {config.get('gpu_device_ids', 'N/A')}")
     print("=" * 60)
 
-    # 检查预计算嵌入
-    if config.get('use_precomputed', False):
+    # 检查预计算嵌入（仅 use_llm=True 时有意义）
+    if config.get('use_precomputed', False) and config.get('use_llm', False):
         emb_path = os.path.join(project_root, 'data/embeddings/question_embeddings.pkl')
         if not os.path.exists(emb_path):
             print("\n❌ 预计算嵌入不存在！")
@@ -541,14 +542,17 @@ def main():
             tokenizer = AutoTokenizer.from_pretrained(model_path)
             print(f"✓ 加载tokenizer: {model_path}")
 
-    # 加载q->kc映射（如果使用GNN）
+    # 加载q->kc映射（GNN 或 LLM 对比损失都需要）
     q_to_kc_mapping = None
     edge_index = None
-    if config.get('use_gnn', False):
+    need_kc_mapping = config.get('use_gnn', False) or config.get('use_llm', False)
+    if need_kc_mapping:
         q_to_kc_mapping = load_q_to_kc_mapping(dataset_name, data_dir)
         if q_to_kc_mapping is None:
-            print("⚠️  无法加载q->kc映射，关闭GNN")
-            config['use_gnn'] = False
+            print("⚠️  无法加载q->kc映射")
+            if config.get('use_gnn', False):
+                print("   关闭GNN")
+                config['use_gnn'] = False
         else:
             # 自动校正 n_kc，避免配置值过小导致索引越界
             inferred_n_kc = max(q_to_kc_mapping.values()) + 1 if q_to_kc_mapping else 0
@@ -558,18 +562,19 @@ def main():
                 config['n_kc'] = inferred_n_kc
                 config['gnn_n_kc'] = inferred_n_kc
 
-            edge_index, edge_max_kc = load_edge_index(dataset_name, data_dir, torch.device('cpu'))
-            if edge_index is None:
-                print("⚠️  未找到edge_index，GNN先决图分支将被跳过")
-            elif edge_max_kc is not None:
-                # 检查 edge_index 中的最大 kc_id 是否超出 n_kc
-                current_n_kc = config.get('gnn_n_kc', config.get('n_kc', 100))
-                if edge_max_kc >= current_n_kc:
-                    required_n_kc = edge_max_kc + 1
-                    print(f"⚠️  edge_index 包含 kc_id={edge_max_kc}，超出 n_kc={current_n_kc}")
-                    print(f"🔧 自动提升 n_kc: {current_n_kc} -> {required_n_kc}")
-                    config['n_kc'] = required_n_kc
-                    config['gnn_n_kc'] = required_n_kc
+    # edge_index 仅 GNN 需要
+    if config.get('use_gnn', False) and q_to_kc_mapping is not None:
+        edge_index, edge_max_kc = load_edge_index(dataset_name, data_dir, torch.device('cpu'))
+        if edge_index is None:
+            print("⚠️  未找到edge_index，GNN先决图分支将被跳过")
+        elif edge_max_kc is not None:
+            current_n_kc = config.get('gnn_n_kc', config.get('n_kc', 100))
+            if edge_max_kc >= current_n_kc:
+                required_n_kc = edge_max_kc + 1
+                print(f"⚠️  edge_index 包含 kc_id={edge_max_kc}，超出 n_kc={current_n_kc}")
+                print(f"🔧 自动提升 n_kc: {current_n_kc} -> {required_n_kc}")
+                config['n_kc'] = required_n_kc
+                config['gnn_n_kc'] = required_n_kc
 
     # 加载预计算嵌入（仅在 LLM 分支启用时有意义）
     precomputed_embeddings = None
@@ -578,6 +583,7 @@ def main():
             precomputed_embeddings = load_precomputed_embeddings(
                 data_dir,
                 use_gnn=config.get('use_gnn', False),
+                use_llm=True,
             )
             print("✅ 预计算嵌入已加载到训练流程")
         except Exception as e:
@@ -600,7 +606,8 @@ def main():
             print(f"✓ 回退成功，已加载在线tokenizer: {model_path}")
 
     if config.get('use_graph_similarity', config.get('recommendation_use_graph_similarity', False)):
-        print("⚠️  use_graph_similarity 已开启，但当前训练主流程尚未接入 DCFSimGraphEnhanced")
+        print("ℹ️  use_graph_similarity=true: DCFSimGraphEnhanced 是后处理工具类，"
+              "用于训练后的用户相似度分析，不影响训练过程")
 
     # 创建模型
     print("\n🤖 创建模型...")
@@ -631,7 +638,7 @@ def main():
             d_fc=config.get('model_d_fc', config.get('d_fc', 512)),
             n_heads=config.get('model_n_heads', config.get('n_heads', 8)),
             n_layers=config.get('model_n_layers', config.get('n_layers', 2)),
-            n_know=config.get('model_n_know', config.get('n_know', 32)),
+            n_know=config.get('model_n_know', config.get('n_know', 64)),
             lambda_cl=config.get('recommendation_lambda_cl', config.get('lambda_cl', 0.1)),
             dropout=config.get('model_dropout', config.get('dropout', 0.2)),
             proj=config.get('proj', False),
@@ -647,6 +654,8 @@ def main():
             lambda_contra=config.get('llm_lambda_contra', config.get('lambda_contra', 0.3)),
             contrast_temperature=config.get('llm_contrast_temperature', config.get('contrast_temperature', 0.07)),
             use_gnn=config.get('use_gnn', False),
+            cross_attn_heads=config.get('model_cross_attn_heads', 4),
+            freeze_bert=config.get('llm_freeze_bert', True),
             n_kc=final_n_kc,
             gnn_layers=config.get('gnn_gnn_layers', config.get('gnn_layers', 2)),
         )
@@ -704,49 +713,34 @@ def main():
         optimizer, T_max=epochs, eta_min=config.get('learning_rate', 0.001) * 0.01
     )
 
-    # 设置设备和多GPU
+    # 设置设备（自动选择最空闲的 GPU）
     device = torch.device(config.get('device', config.get('training_device', 'cuda')))
-
-    # 检查是否使用多GPU
     gpu_device_ids = config.get('gpu_device_ids', None)
-    use_multi_gpu = (
-        gpu_device_ids is not None
-        and len(gpu_device_ids) > 1
-        and str(device).startswith('cuda')
-    )
 
-    if use_multi_gpu:
-        print(f"🚀 使用多GPU训练: {gpu_device_ids}")
-        # 检查所有GPU是否可用
-        available_gpus = []
-        for gpu_id in gpu_device_ids:
-            if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
-                available_gpus.append(gpu_id)
-            else:
-                print(f"⚠️  GPU {gpu_id} 不可用，跳过")
+    if gpu_device_ids and str(device).startswith('cuda') and torch.cuda.is_available():
+        # 按显存占用排序，优先选最空闲的 GPU
+        gpu_free = []
+        for gid in gpu_device_ids:
+            if gid < torch.cuda.device_count():
+                free_mem = torch.cuda.mem_get_info(gid)[0]  # (free, total)
+                gpu_free.append((gid, free_mem))
+        gpu_free.sort(key=lambda x: -x[1])  # 按空闲显存降序
 
-        if len(available_gpus) > 1:
-            model = torch.nn.DataParallel(model, device_ids=available_gpus)
-            device = torch.device(f'cuda:{available_gpus[0]}')
-            batch_size = config.get('batch_size', config.get('training_batch_size', 16))
-            grad_accum = config.get('gradient_accumulation_steps',
-                                   config.get('training_gradient_accumulation_steps', 1))
-            print(f"✅ DataParallel已启用")
-            print(f"   主设备: cuda:{available_gpus[0]}")
-            print(f"   所有设备: {available_gpus}")
-            print(f"   批大小: {batch_size}")
-            print(f"   梯度累积步数: {grad_accum}")
-            print(f"   有效批大小: {batch_size * grad_accum}")
-            print(f"   每GPU批大小约: {batch_size // len(available_gpus)}")
-            print(f"💡 提示: DataParallel会在所有GPU上计算，但主卡负载会更高")
-        elif len(available_gpus) == 1:
-            print(f"⚠️  只有1个可用GPU，使用单GPU模式")
-            device = torch.device(f'cuda:{available_gpus[0]}')
+        if gpu_free:
+            best_gpu = gpu_free[0]
+            device = torch.device(f'cuda:{best_gpu[0]}')
+            print(f"✅ 自动选择 GPU {best_gpu[0]}（空闲 {best_gpu[1] // 1024} MiB / {torch.cuda.get_device_properties(best_gpu[0]).total_memory // 1024} MiB）")
+            if len(gpu_free) > 1:
+                print(f"   其他 GPU: {[(g, f//1024) for g, f in gpu_free[1:]]}")
         else:
-            print("⚠️  没有可用GPU，使用CPU")
+            print("⚠️  配置的 GPU 不可用，回退 CPU")
             device = torch.device('cpu')
     else:
         print(f"📱 使用设备: {device}")
+
+    # 将选定的设备写回 config，确保 train_epoch/validate 使用同一设备
+    config['device'] = str(device)
+    config['training_device'] = str(device)
 
     model.to(device)
     if edge_index is not None:

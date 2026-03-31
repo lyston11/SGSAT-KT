@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v3.1** — 基座模型优化: n_know=64 + cosine annealing + 重复次数嵌入
+**v4.0** — Cross-Attention 融合: ID Query attend LLM 语义特征
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -21,6 +21,7 @@
 | 重复嵌入 | max_repeats=20 (v3.1 新增) |
 | 学习率调度 | Cosine Annealing (v3.1 新增) |
 | 注意力头数 | 8 |
+| Cross-Attn 头数 | 4 (v4.0 新增) |
 
 ## 两段式训练
 
@@ -41,17 +42,18 @@
 
 ### Embedding 阶段
 
-v3.0 采用门控融合机制动态平衡 ID 和 LLM 信号：
+v4.0 采用 Cross-Attention 融合，ID embedding 作为 Query 主动 attend LLM 语义特征：
 
 ```
 # 多层投影（保留 v2.0 改进）
 llm_vec = pkl查表(2560) → Linear(2560→512)→GELU→LN→Linear(512→256)→LN
 
-# 门控融合（v3.0 新增）
-gate = sigmoid(Linear(256)(llm_vec))        # 门控值 [0,1]
-gated_llm = gate * llm_vec                   # 门控 LLM 信号
-id_proj = Linear(128→256)(ID_Embedding)      # ID 投影到同维度
-q_emb = LayerNorm(gated_llm + id_proj)       # 同维度融合
+# Cross-Attention 融合（v4.0 新增）
+id_proj = Linear(128→256)(ID_Embedding)      # ID 投影到同维度 (Query)
+attn_out = CrossAttn(Q=id_proj, K=llm_vec, V=llm_vec)  # ID Query attend LLM
+gate = gate_net(attn_out)                     # 2层gate→标量 [0,1]
+fused = gate * attn_out + (1-gate) * id_proj  # 门控残差
+q_emb = LayerNorm(fused)                      # 同维度融合
 
 # GNN 先决图（保留）
 q_emb = q_emb + GNN(kc_ids, edge_index)
@@ -59,7 +61,8 @@ q_emb = q_emb + GNN(kc_ids, edge_index)
 
 - **ID Embedding**: `nn.Embedding(n_questions+1, 128)` — 可学习的题目 ID 查表
 - **ID Dropout** (v3.0): 训练时 p=0.15 将 ID 置零，迫使模型依赖 LLM
-- **LLM 门控**: `sigmoid(W_g · llm_vec) * llm_vec` — 动态调节 LLM 信号贡献
+- **LLM Cross-Attention** (v4.0): ID embedding 作为 Query attend LLM Key/Value — 提取 task-specific 语义
+- **门控残差** (v4.0): 2 层 gate network (Linear→ReLU→Linear→Sigmoid) → 标量，防止 attention 坍塌
 - **KC 融合门**: `W_p = nn.Linear(256, 256, bias=False)` — 知识点嵌入融合权重
 - **GNN**: `SimpleGCNLayer × 2` — 先决图消息传递，带残差 LayerNorm
 
@@ -155,7 +158,27 @@ gnn:
 
 ## 版本历史
 
-### v3.1 (当前)
+### v4.0 (当前)
+- Cross-Attention 融合: ID embedding 作为 Query attend LLM Key/Value，提取 task-specific 语义
+- 门控残差: 2 层 gate network 输出标量，防止 attention 坍塌
+- Causal Mask: 保持 KT 自回归特性
+- 替代 v3.0 的逐位置标量门控，解决 task-agnostic LLM 嵌入问题
+- 配置传递修正: `cross_attn_heads`, `freeze_bert` 从 yaml 正确传递到模型
+- 修复: 在线 LLM fallback list/tensor 类型冲突、ID fallback 维度不匹配 (128→256)
+- 修复: shell 脚本 test/baseline 模式不再要求 embedding 文件
+- 修复: 预计算嵌入检查增加 `use_llm` 守卫
+- 清理: 删除 17 个无效配置项、死代码 TrainingConfig 类
+- 依赖: pyproject.toml 与 requirements.txt 版本对齐，修复拼写错误
+- 预计算脚本: 支持数据集参数 `python scripts/1_precompute.py [dataset]`
+- DCFSimGraphEnhanced: 标注为后处理工具类
+- 测试: `make test` → pytest，`make smoke-test` → 训练冒烟测试
+- 修复: DataParallel 实际无效（get_loss/predict 非 forward），改为单 GPU + 明确警告
+- 修复: DKT baseline sigmoid 双重应用（forward 不再做 sigmoid，返回 logits）
+- 修复: s_emb 在 GNN/repeat 之后构造，确保包含完整特征
+- 修复: knowledge_consistency_loss 按 lens 过滤 padding 位置
+- 修复: kc_ids 在 use_llm=true 时也加载（不再要求 use_gnn=true）
+
+### v3.1
 - n_know 扩容: 32→64，匹配 xes 数据集 812 个知识点的表达需求
 - Cosine Annealing 学习率调度: 替代固定 lr，后期更稳定
 - Embedding dropout: q_emb/s_emb 在送入 Transformer 前施加 dropout
