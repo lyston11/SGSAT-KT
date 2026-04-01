@@ -23,6 +23,9 @@ class PrecomputedEmbeddings:
         self.question_id_to_idx = None
         self.kc_id_to_idx = None
         self.hidden_size = None
+        self.model_path = None
+        self.question_dataset_name = None
+        self.kc_dataset_name = None
 
     def load_question_embeddings(self, path=None):
         """加载题目嵌入"""
@@ -40,6 +43,8 @@ class PrecomputedEmbeddings:
         self.question_ids = data["question_ids"]
         self.question_id_to_idx = {int(qid): idx for idx, qid in enumerate(self.question_ids)}
         self.hidden_size = data.get("hidden_size", 2560)
+        self.model_path = data.get("model_path")
+        self.question_dataset_name = data.get("dataset_name")
 
         print(f"✅ 加载了 {len(self.question_ids)} 个题目嵌入")
         print(f"📊 嵌入维度: {self.hidden_size}")
@@ -63,6 +68,9 @@ class PrecomputedEmbeddings:
         self.kc_id_to_idx = {int(kid): idx for idx, kid in enumerate(self.kc_ids)}
         if self.hidden_size is None:
             self.hidden_size = data.get("hidden_size", 2560)
+        if self.model_path is None:
+            self.model_path = data.get("model_path")
+        self.kc_dataset_name = data.get("dataset_name")
 
         print(f"✅ 加载了 {len(self.kc_ids)} 个知识点嵌入")
         print(f"📊 嵌入维度: {self.hidden_size}")

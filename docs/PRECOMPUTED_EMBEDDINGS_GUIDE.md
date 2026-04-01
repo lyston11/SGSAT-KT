@@ -35,6 +35,8 @@
 脚本会自动检测:
 1. pkl 文件是否存在
 2. 嵌入维度是否与当前配置的模型 `hidden_size` 匹配
+3. 嵌入文件中的 `dataset_name` 是否与当前训练数据集一致
+4. 当前数据集中被题目引用的 KC 是否都存在对应预计算嵌入
 
 如果不匹配（如切换了 BERT → Qwen3），会自动重新预计算。
 
@@ -50,8 +52,10 @@ rm data/embeddings/*.pkl
 ```
 pkl 文件 (2560维) → PrecomputedEmbeddings (内存查表)
     → PrecomputedEmbeddingLayer
-        → nn.Linear(2560, 128)  投影到模型维度
-    → 与 ID Embedding 相加融合
+        → Linear(2560→512) → GELU → LN → Linear(512→256) → LN
+    → 融合题目 KC 语义: e_q + W_p(e_kc)
+    → ID Query attend LLM Key/Value (Cross-Attention)
+    → 门控残差 + LayerNorm
 ```
 
 ### 关键代码路径
@@ -79,6 +83,7 @@ pkl 文件结构:
     "question_ids": ["0", "1", "2", ...],      # 题目/知识点 ID 列表
     "embeddings": np.ndarray,                    # shape: (N, hidden_size)
     "hidden_size": 2560,                         # 嵌入维度
-    "model_path": "pretrained_models/qwen3-4b"   # 使用的模型路径
+    "model_path": "pretrained_models/qwen3-4b",  # 使用的模型路径
+    "dataset_name": "xes"                        # 当前嵌入所属数据集
 }
 ```

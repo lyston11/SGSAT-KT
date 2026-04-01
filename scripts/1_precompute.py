@@ -63,11 +63,11 @@ class QwenEmbeddingGenerator:
         )
         return embeddings
 
-    def precompute_question_embeddings(self, questions_data, output_path, batch_size=32):
+    def precompute_question_embeddings(self, questions_data, output_path, batch_size=32, dataset_name=None):
         """预计算题目嵌入"""
         print(f"📝 预计算 {len(questions_data)} 个题目嵌入...")
 
-        question_ids = sorted(questions_data.keys())
+        question_ids = sorted(questions_data.keys(), key=lambda x: int(x))
         question_texts = [questions_data[qid].get("text") or questions_data[qid].get("content", "") for qid in question_ids]
 
         question_embeddings = self.batch_encode_texts(
@@ -81,6 +81,7 @@ class QwenEmbeddingGenerator:
             "embeddings": question_embeddings,
             "hidden_size": self.hidden_size,
             "model_path": self.model_path,
+            "dataset_name": dataset_name,
         }
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -90,11 +91,11 @@ class QwenEmbeddingGenerator:
         print(f"✅ 题目嵌入已保存: {output_path}")
         return result
 
-    def precompute_kc_embeddings(self, kc_data, output_path, batch_size=32):
+    def precompute_kc_embeddings(self, kc_data, output_path, batch_size=32, dataset_name=None):
         """预计算知识点嵌入"""
         print(f"📚 预计算 {len(kc_data)} 个知识点嵌入...")
 
-        kc_ids = sorted(kc_data.keys())
+        kc_ids = sorted(kc_data.keys(), key=lambda x: int(x))
         kc_texts = [kc_data[kid] for kid in kc_ids]
 
         kc_embeddings = self.batch_encode_texts(
@@ -108,6 +109,7 @@ class QwenEmbeddingGenerator:
             "embeddings": kc_embeddings,
             "hidden_size": self.hidden_size,
             "model_path": self.model_path,
+            "dataset_name": dataset_name,
         }
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -176,7 +178,8 @@ def main():
         print("=" * 60)
         generator.precompute_question_embeddings(
             questions,
-            os.path.join(project_root, "data/embeddings/question_embeddings.pkl")
+            os.path.join(project_root, "data/embeddings/question_embeddings.pkl"),
+            dataset_name=dataset_name,
         )
     else:
         print(f"⚠️  文件不存在: {q_file}")
@@ -185,12 +188,36 @@ def main():
         with open(kc_file, 'r', encoding='utf-8') as f:
             kcs = json.load(f)
 
+        # 补全缺失的 KC：从题目文本中提取
+        if os.path.exists(q_file):
+            # 收集每个 KC 下的题目文本
+            kc_to_questions = {}
+            for qid, info in questions.items():
+                skill = info.get('skill', info.get('kc', None))
+                if skill is not None and int(skill) >= 0:
+                    kc_to_questions.setdefault(int(skill), []).append(
+                        info.get('text', info.get('content', ''))
+                    )
+
+            missing_kcs = []
+            for kc_id, q_texts_list in sorted(kc_to_questions.items()):
+                kc_id_str = str(kc_id)
+                if kc_id_str not in kcs:
+                    # 用该 KC 下的前 3 个题目文本拼接作为 fallback
+                    fallback_text = '；'.join(q_texts_list[:3])
+                    kcs[kc_id_str] = fallback_text
+                    missing_kcs.append(kc_id)
+
+            if missing_kcs:
+                print(f"⚠️  补全 {len(missing_kcs)} 个缺失 KC 文本: {missing_kcs}")
+
         print(f"\n" + "=" * 60)
         print("📚 Step 2: 知识点嵌入")
         print("=" * 60)
         generator.precompute_kc_embeddings(
             kcs,
-            os.path.join(project_root, "data/embeddings/kc_embeddings.pkl")
+            os.path.join(project_root, "data/embeddings/kc_embeddings.pkl"),
+            dataset_name=dataset_name,
         )
     else:
         print(f"⚠️  文件不存在: {kc_file}")

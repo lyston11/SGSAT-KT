@@ -28,7 +28,7 @@ llm:
 # Innovation 2: GNN Prerequisite Graph
 gnn:
   use_gnn: true
-  n_kc: 100
+  n_kc: 855
   gnn_layers: 2
 
 # Innovation 3: 对比学习 + DCF-Sim 后处理工具
@@ -54,6 +54,8 @@ training:
   save_model: true
   dataset: "xes"  # 默认数据集
   gradient_accumulation_steps: 2  # 梯度累积，模拟batch_size=32
+  validation_ratio: 0.1
+  validation_seed: 42
 
 # GPU Settings（自动选最空闲的单 GPU，DataParallel 对当前模型无效）
 gpu:

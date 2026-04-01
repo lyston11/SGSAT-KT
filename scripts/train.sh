@@ -24,21 +24,67 @@ else
     if [ ! -f "data/embeddings/question_embeddings.pkl" ]; then
         echo "❌ 预计算嵌入不存在"
         NEED_PRECOMPUTE=true
+    elif [ ! -f "data/embeddings/kc_embeddings.pkl" ]; then
+        echo "❌ 知识点预计算嵌入不存在"
+        NEED_PRECOMPUTE=true
     else
-        # 检查嵌入维度是否与当前配置的模型匹配
-        EMBED_DIM=$(python -c "
-import pickle, yaml
+        # 检查嵌入维度、数据集元信息和 KC 覆盖
+        EMBED_INFO=$(python - <<'PY'
+import json
+import pickle
+import yaml
+from pathlib import Path
+
 with open('configs/default.yaml') as f:
     cfg = yaml.safe_load(f)
+
+dataset = cfg.get('training', {}).get('dataset', 'xes')
 model_path = cfg.get('llm', {}).get('pretrained_model', 'pretrained_models/bert-base-chinese')
+
 with open('data/embeddings/question_embeddings.pkl', 'rb') as f:
-    data = pickle.load(f)
-print(f'{data.get(\"hidden_size\", \"?\")}|{model_path}')
-" 2>/dev/null)
-        EMBED_HIDDEN=$(echo "$EMBED_DIM" | cut -d'|' -f1)
-        EMBED_MODEL=$(echo "$EMBED_DIM" | cut -d'|' -f2)
-        echo "📊 当前嵌入: 模型=$EMBED_MODEL, 维度=$EMBED_HIDDEN"
-        echo "📄 配置模型: $(grep 'pretrained_model' configs/default.yaml | head -1 | awk '{print $2}' | tr -d '\"')"
+    q_data = pickle.load(f)
+with open('data/embeddings/kc_embeddings.pkl', 'rb') as f:
+    kc_data = pickle.load(f)
+
+required_kc = set()
+text_path = Path('data/text_data') / f'{dataset}_question_texts.json'
+if text_path.exists():
+    with text_path.open(encoding='utf-8') as f:
+        q_texts = json.load(f)
+    for info in q_texts.values():
+        skill = info.get('skill', '-1')
+        try:
+            kc_id = int(skill)
+        except Exception:
+            continue
+        if kc_id >= 0:
+            required_kc.add(kc_id)
+
+kc_ids = {int(x) for x in kc_data.get('kc_ids', [])}
+missing_kc = sorted(required_kc - kc_ids)
+
+print(
+    "|".join(
+        [
+            str(q_data.get('hidden_size', '?')),
+            str(q_data.get('model_path', '')),
+            str(model_path),
+            str(q_data.get('dataset_name', '')),
+            str(kc_data.get('dataset_name', '')),
+            str(len(missing_kc)),
+        ]
+    )
+)
+PY
+)
+        EMBED_HIDDEN=$(echo "$EMBED_INFO" | cut -d'|' -f1)
+        EMBED_MODEL=$(echo "$EMBED_INFO" | cut -d'|' -f2)
+        CONFIG_MODEL=$(echo "$EMBED_INFO" | cut -d'|' -f3)
+        EMBED_Q_DATASET=$(echo "$EMBED_INFO" | cut -d'|' -f4)
+        EMBED_KC_DATASET=$(echo "$EMBED_INFO" | cut -d'|' -f5)
+        MISSING_KC_COUNT=$(echo "$EMBED_INFO" | cut -d'|' -f6)
+        echo "📊 当前嵌入: 模型=$EMBED_MODEL, 维度=$EMBED_HIDDEN, q_dataset=${EMBED_Q_DATASET:-<missing>}, kc_dataset=${EMBED_KC_DATASET:-<missing>}"
+        echo "📄 配置模型: $CONFIG_MODEL"
 
         # 通过实际加载模型获取真实维度来校验
         EXPECTED_DIM=$(python -c "
@@ -57,6 +103,24 @@ else:
 
         if [ "$EMBED_HIDDEN" != "$EXPECTED_DIM" ]; then
             echo "⚠️  嵌入维度($EMBED_HIDDEN)与模型期望维度($EXPECTED_DIM)不匹配"
+            NEED_PRECOMPUTE=true
+        elif [ -z "$EMBED_Q_DATASET" ] || [ -z "$EMBED_KC_DATASET" ]; then
+            echo "⚠️  预计算嵌入缺少 dataset_name 元信息，需要重新生成"
+            NEED_PRECOMPUTE=true
+        elif [ "$EMBED_Q_DATASET" != "$EMBED_KC_DATASET" ]; then
+            echo "⚠️  题目嵌入与知识点嵌入来自不同数据集"
+            NEED_PRECOMPUTE=true
+        elif [ "$EMBED_Q_DATASET" != "$(python - <<'PY'
+import yaml
+with open('configs/default.yaml') as f:
+    cfg = yaml.safe_load(f)
+print(cfg.get('training', {}).get('dataset', 'xes'))
+PY
+)" ]; then
+            echo "⚠️  预计算嵌入数据集与当前配置不一致"
+            NEED_PRECOMPUTE=true
+        elif [ "$MISSING_KC_COUNT" != "0" ]; then
+            echo "⚠️  检测到 $MISSING_KC_COUNT 个被题目引用的 KC 缺少预计算嵌入"
             NEED_PRECOMPUTE=true
         else
             echo "✅ 预计算嵌入与配置匹配，跳过"

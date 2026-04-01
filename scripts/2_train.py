@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+from torch.utils.data import DataLoader, Subset
 
 # 添加项目路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,7 +20,7 @@ sys.path.insert(0, project_root)
 # 导入配置加载器
 from scripts.utils.config_loader import ConfigLoader
 
-from DTransformer.data import KTData
+from DTransformer.data import KTData, transform_batch
 from DTransformer.eval import Evaluator
 from DTransformer.model import DTransformer
 from DTransformer.embedding_loader import PrecomputedEmbeddings
@@ -225,6 +226,123 @@ def load_precomputed_embeddings(data_dir, use_gnn=False, use_llm=False):
     return precomputed
 
 
+class KTDataSubset:
+    """轻量封装: 复用 KTData.__getitem__，为生成的 train/valid 划分构造 DataLoader。"""
+
+    def __init__(self, base_data, indices, batch_size, shuffle=False):
+        self.base_data = base_data
+        self.indices = list(indices)
+        subset = Subset(base_data, self.indices)
+        self.loader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=transform_batch,
+            num_workers=0,
+        )
+
+    def __iter__(self):
+        return iter(self.loader)
+
+    def __len__(self):
+        return len(self.indices)
+
+
+def build_generated_valid_split(train_path, inputs, seq_len, train_batch_size,
+                                eval_batch_size, valid_ratio=0.1, seed=42):
+    """当数据集未提供 valid 划分时，从 train 中确定性切出验证集。"""
+    if not (0.0 < valid_ratio < 1.0):
+        raise ValueError(f"validation_ratio 必须在 (0,1) 内，当前为 {valid_ratio}")
+
+    base_data = KTData(
+        train_path,
+        inputs,
+        seq_len=seq_len,
+        batch_size=1,
+        shuffle=False,
+    )
+    n_samples = len(base_data)
+    if n_samples < 2:
+        raise ValueError("样本数不足，无法从 train 中切分出独立验证集")
+
+    valid_size = max(1, int(round(n_samples * valid_ratio)))
+    valid_size = min(valid_size, n_samples - 1)
+
+    rng = np.random.default_rng(seed)
+    indices = np.arange(n_samples)
+    rng.shuffle(indices)
+
+    valid_indices = indices[:valid_size].tolist()
+    train_indices = indices[valid_size:].tolist()
+
+    train_data = KTDataSubset(
+        base_data,
+        train_indices,
+        batch_size=train_batch_size,
+        shuffle=True,
+    )
+    valid_data = KTDataSubset(
+        base_data,
+        valid_indices,
+        batch_size=eval_batch_size,
+        shuffle=False,
+    )
+
+    split_info = {
+        "source": "train.txt",
+        "strategy": "deterministic_random_split",
+        "seed": seed,
+        "valid_ratio": valid_ratio,
+        "train_samples": len(train_indices),
+        "valid_samples": len(valid_indices),
+    }
+    return train_data, valid_data, split_info
+
+
+def validate_precomputed_embeddings(precomputed, dataset_name, dataset_config, q_to_kc_mapping=None):
+    """校验预计算嵌入是否与当前数据集一致，避免静默错用旧工件。"""
+    issues = []
+
+    q_dataset_name = getattr(precomputed, "question_dataset_name", None)
+    kc_dataset_name = getattr(precomputed, "kc_dataset_name", None)
+    if q_dataset_name != dataset_name:
+        issues.append(
+            f"题目嵌入 dataset_name={q_dataset_name!r} 与当前数据集 {dataset_name!r} 不一致"
+        )
+    if kc_dataset_name != dataset_name:
+        issues.append(
+            f"知识点嵌入 dataset_name={kc_dataset_name!r} 与当前数据集 {dataset_name!r} 不一致"
+        )
+
+    expected_question_count = dataset_config.get("n_questions")
+    loaded_question_count = len(precomputed.question_id_to_idx or {})
+    if expected_question_count is not None and loaded_question_count < expected_question_count:
+        issues.append(
+            f"题目嵌入数量不足: 期望至少 {expected_question_count}，实际 {loaded_question_count}"
+        )
+
+    if q_to_kc_mapping:
+        missing_question_ids = sorted(
+            set(q_to_kc_mapping.keys()) - set(precomputed.question_id_to_idx or {})
+        )
+        if missing_question_ids:
+            sample = missing_question_ids[:10]
+            issues.append(
+                f"题目嵌入缺失 {len(missing_question_ids)} 个 q_id，例如 {sample}"
+            )
+
+        missing_kc_ids = sorted(
+            set(q_to_kc_mapping.values()) - set(precomputed.kc_id_to_idx or {})
+        )
+        if missing_kc_ids:
+            sample = missing_kc_ids[:10]
+            issues.append(
+                f"知识点嵌入缺失 {len(missing_kc_ids)} 个 kc_id，例如 {sample}"
+            )
+
+    return issues
+
+
 def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=None,
                 q_to_kc_mapping=None, edge_index=None, scaler=None, use_amp=False):
     """训练一个epoch"""
@@ -239,6 +357,8 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
     gradient_accumulation_steps = config.get('gradient_accumulation_steps',
                                               config.get('training_gradient_accumulation_steps', 1))
     use_cl_loss = config.get('cl_loss', config.get('recommendation_cl_loss', False))
+    accumulation_counter = 0
+    optimizer.zero_grad()
 
     # KTData.__len__ 返回样本数，进度条应显示 batch 数（DataLoader 长度）
     total_batches = len(train_data.loader)
@@ -265,9 +385,7 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
 
         # 准备GNN输入 / LLM对比损失输入
         kc_ids = None
-        need_kc_ids = config.get('use_gnn', False) or (
-            config.get('use_llm', False) and config.get('llm_lambda_contra', config.get('lambda_contra', 0)) > 0
-        )
+        need_kc_ids = config.get('use_gnn', False) or config.get('use_llm', False)
         if need_kc_ids and q_to_kc_mapping is not None:
             n_kc = config.get('gnn_n_kc', config.get('n_kc', None))
             kc_ids = add_kc_ids_to_batch(q, q_to_kc_mapping, n_kc)
@@ -323,6 +441,7 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
 
             # 梯度累积：损失除以累积步数
             loss = loss / gradient_accumulation_steps
+            accumulation_counter += 1
 
             # 反向传播
             # 处理 DataParallel 的参数
@@ -334,7 +453,7 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
                 loss.backward()
 
             # 每累积一定步数后更新参数
-            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            if accumulation_counter % gradient_accumulation_steps == 0:
                 if use_amp and scaler is not None:
                     scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
@@ -351,7 +470,7 @@ def train_epoch(model, train_data, optimizer, config, q_texts=None, tokenizer=No
             pbar.set_postfix({'loss': total_loss / total_cnt})
 
     # 处理最后可能未更新的梯度
-    if (processed_batches % gradient_accumulation_steps) != 0:
+    if (accumulation_counter % gradient_accumulation_steps) != 0:
         params_to_clip = model.module.parameters() if hasattr(model, 'module') else model.parameters()
         if use_amp and scaler is not None:
             scaler.unscale_(optimizer)
@@ -395,8 +514,9 @@ def validate(model, valid_data, config, q_texts=None, tokenizer=None,
                     q_text_input = [q_text_input]
 
             kc_ids = None
-            if config.get('use_gnn', False) and q_to_kc_mapping is not None:
-                kc_ids = add_kc_ids_to_batch(q, q_to_kc_mapping)
+            if (config.get('use_gnn', False) or config.get('use_llm', False)) and q_to_kc_mapping is not None:
+                n_kc = config.get('gnn_n_kc', config.get('n_kc', None))
+                kc_ids = add_kc_ids_to_batch(q, q_to_kc_mapping, n_kc)
                 # 注意：add_kc_ids_to_batch 已经处理了 list 情况
 
             for idx, (q, s, pid) in enumerate(zip(q, s, pid)):
@@ -511,22 +631,61 @@ def main():
     config['seq_len'] = seq_len  # 添加到 config 中
 
     batch_size = config.get('batch_size', config.get('training_batch_size', 16))
-    train_data = KTData(
-        os.path.join(data_dir, dataset_config["train"]),
-        dataset_config["inputs"],
-        seq_len=seq_len,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
     test_batch_size = config.get('test_batch_size', config.get('training_test_batch_size', 8))
-    valid_data = KTData(
-        os.path.join(data_dir, dataset_config.get("valid", dataset_config["test"])),
-        dataset_config["inputs"],
-        seq_len=seq_len,
-        batch_size=test_batch_size,
-    )
-    print(f"✅ 数据加载完成: {dataset_name}")
+    train_path = os.path.join(data_dir, dataset_config["train"])
+    split_info = None
+
+    if "valid" in dataset_config:
+        train_data = KTData(
+            train_path,
+            dataset_config["inputs"],
+            seq_len=seq_len,
+            batch_size=batch_size,
+            shuffle=True,
+        )
+        valid_data = KTData(
+            os.path.join(data_dir, dataset_config["valid"]),
+            dataset_config["inputs"],
+            seq_len=seq_len,
+            batch_size=test_batch_size,
+        )
+        split_info = {
+            "source": "provided_files",
+            "train_path": dataset_config["train"],
+            "valid_path": dataset_config["valid"],
+        }
+    else:
+        valid_ratio = float(config.get('training_validation_ratio', config.get('validation_ratio', 0.1)))
+        valid_seed = int(config.get('training_validation_seed', config.get('validation_seed', 42)))
+        train_data, valid_data, split_info = build_generated_valid_split(
+            train_path,
+            dataset_config["inputs"],
+            seq_len,
+            batch_size,
+            test_batch_size,
+            valid_ratio=valid_ratio,
+            seed=valid_seed,
+        )
+        print(
+            f"⚠️  数据集未提供 valid 划分，已从 train.txt 中生成验证集 "
+            f"(ratio={valid_ratio:.2f}, seed={valid_seed})"
+        )
+
+    # 独立测试集（训练中不使用，仅在训练结束后做最终评估）
+    test_data = None
+    if "test" in dataset_config:
+        test_data = KTData(
+            os.path.join(data_dir, dataset_config["test"]),
+            dataset_config["inputs"],
+            seq_len=seq_len,
+            batch_size=test_batch_size,
+        )
+
+    config['validation_split_info'] = split_info
+    if test_data is not None:
+        print(f"✅ 数据加载完成: {dataset_name} (train={len(train_data)}, valid={len(valid_data)}, test={len(test_data)})")
+    else:
+        print(f"✅ 数据加载完成: {dataset_name} (train={len(train_data)}, valid={len(valid_data)})")
 
     # 加载文本数据（如果使用LLM）
     q_texts = None
@@ -585,11 +744,22 @@ def main():
                 use_gnn=config.get('use_gnn', False),
                 use_llm=True,
             )
+            embedding_issues = validate_precomputed_embeddings(
+                precomputed_embeddings,
+                dataset_name,
+                dataset_config,
+                q_to_kc_mapping=q_to_kc_mapping,
+            )
+            if embedding_issues:
+                issues_text = "\n".join(f"  - {issue}" for issue in embedding_issues)
+                raise RuntimeError(
+                    "预计算嵌入校验失败，请重新运行 ./scripts/1_precompute.sh：\n"
+                    f"{issues_text}"
+                )
             print("✅ 预计算嵌入已加载到训练流程")
         except Exception as e:
-            print(f"⚠️  预计算嵌入加载失败，回退到在线文本分支: {e}")
-            precomputed_embeddings = None
-            config['use_precomputed'] = False
+            print(f"❌ 预计算嵌入不可用: {e}")
+            sys.exit(1)
     elif config.get('use_precomputed', False) and not config.get('use_llm', False):
         print("ℹ️  use_llm=False，跳过预计算嵌入加载")
         config['use_precomputed'] = False
@@ -765,6 +935,9 @@ def main():
         config_path = os.path.join(output_dir, "config.json")
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
+        split_info_path = os.path.join(output_dir, "split_info.json")
+        with open(split_info_path, 'w') as f:
+            json.dump(split_info, f, indent=2)
         print(f"📁 输出目录: {output_dir}")
 
     # 训练循环
@@ -772,6 +945,10 @@ def main():
     print(f"\n🏋️  开始训练 {epochs} epochs...")
     best = {"auc": 0}
     best_epoch = 0
+    history = []
+    history_path = os.path.join(output_dir, "metrics_history.json") if output_dir else None
+    summary_path = os.path.join(output_dir, "summary.json") if output_dir else None
+    test_results = None
 
     for epoch in range(1, epochs + 1):
         print(f"\n{'='*60}")
@@ -807,6 +984,17 @@ def main():
         )
         print(f"验证结果: {results}")
 
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": avg_loss,
+            "lr": optimizer.param_groups[0]['lr'],
+            **results,
+        }
+        history.append(epoch_record)
+        if history_path:
+            with open(history_path, 'w') as f:
+                json.dump(history, f, indent=2)
+
         # 保存最佳模型
         if results["auc"] > best["auc"]:
             best = results
@@ -833,9 +1021,49 @@ def main():
     print(f"\n{'='*60}")
     print(f"🎉 训练完成!")
     print(f"{'='*60}")
-    print(f"最佳结果 (Epoch {best_epoch}):")
+    print(f"最佳验证结果 (Epoch {best_epoch}):")
     for k, v in best.items():
         print(f"  {k}: {v:.4f}")
+
+    # 最终测试评估（仅在训练结束后跑一次，不影响模型选择）
+    if test_data is not None:
+        # 加载 best model
+        if output_dir:
+            model_path = os.path.join(output_dir, "best_model.pt")
+            if os.path.exists(model_path):
+                state_dict = torch.load(model_path, map_location=device, weights_only=True)
+                model.load_state_dict(state_dict)
+                print(f"\n📂 加载最佳模型: {model_path}")
+
+        print(f"\n{'='*60}")
+        print(f"📊 独立测试集评估 (test.txt)")
+        print(f"{'='*60}")
+        test_results = validate(
+            model,
+            test_data,
+            config,
+            q_texts,
+            tokenizer,
+            q_to_kc_mapping,
+            edge_index,
+            use_amp,
+        )
+        print(f"测试结果:")
+        for k, v in test_results.items():
+            print(f"  {k}: {v:.4f}")
+
+    if summary_path:
+        with open(summary_path, 'w') as f:
+            json.dump(
+                {
+                    "best_epoch": best_epoch,
+                    "best_valid": best,
+                    "test": test_results,
+                    "split_info": split_info,
+                },
+                f,
+                indent=2,
+            )
 
 
 if __name__ == "__main__":

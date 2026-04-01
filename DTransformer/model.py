@@ -832,7 +832,11 @@ class DTransformer(nn.Module):
             )
         pred_loss /= self.window
 
-        total = pred_loss + cl_loss * self.lambda_cl + reg_loss
+        cons_loss = self.knowledge_consistency_loss(
+            z_1, lens=lens, consistency_weight=0.05
+        )
+
+        total = pred_loss + cl_loss * self.lambda_cl + cons_loss + reg_loss
 
         # v3: 辅助嵌入对比损失
         if self.use_llm and self.lambda_contra > 0:

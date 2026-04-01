@@ -34,13 +34,13 @@ gpu:
   device_ids: [0]  # 只使用GPU 0
 ```
 
-### 多GPU训练（DataParallel）
+### 候选 GPU 列表
 
-多GPU 由 `device_ids` 长度自动决定，列出 2 个以上即启用：
+当前训练脚本会在 `device_ids` 中自动选择最空闲的一张 GPU，而不是启用 `DataParallel`：
 
 ```yaml
 gpu:
-  device_ids: [0, 1]  # 使用GPU 0和1，自动启用DataParallel
+  device_ids: [0, 1]  # 从 GPU 0 和 1 中自动选择空闲显存更多的一张
 ```
 
 ### 特定GPU
@@ -74,13 +74,13 @@ llm:
 
 ### 预设模式（推荐）
 
-在 `configs/default.yaml` 的 `presets` 部分有4个预设：
+在 `configs/default.yaml` 的 `presets` 部分有以下预设：
 
 ```yaml
 presets:
   test:      # 快速验证（5轮，无LLM/GNN）
   baseline:  # 基线模型（100轮，无LLM/GNN）
-  full:      # 完整模型（100轮，LLM+GNN）
+  full:      # 完整模型（30轮，LLM+GNN）
   prod:      # 生产环境（200轮，最佳性能）
   sakt:      # SAKT 基线（100轮）
   akt:       # AKT 基线（100轮）
@@ -101,9 +101,11 @@ conda activate lyston
 ```yaml
 training:
   batch_size: 16        # 批大小（双GPU建议16）
-  n_epochs: 100         # 训练轮数
+  n_epochs: 30          # 训练轮数
   learning_rate: 0.001  # 学习率
   device: "cuda"        # 设备 (cuda 或 cpu)
+  validation_ratio: 0.1 # 无 valid 时从 train 切分验证集比例
+  validation_seed: 42   # 无 valid 时的固定随机种子
 ```
 
 ### 功能开关
@@ -139,23 +141,34 @@ llm:
 - 重复次数嵌入: `max_repeats=20`，建模题目重复出现次数（遗忘/强化信号）
 - Embedding dropout: 训练时对 q_emb/s_emb 施加 dropout 正则化
 
+### v4.1 项目缺陷修复
+
+- 训练/评估职责分离: 无 `valid` 时从 `train.txt` 生成验证集，`test.txt` 仅用于最终评估
+- 预计算工件校验增强: 检查 `dataset_name` 元信息和 KC 覆盖，避免静默复用旧 embedding
+- `cl_loss=True` 时训练目标补回 `knowledge_consistency`
+- 梯度累积按实际反向传播步数统计，兼容序列切块场景
+- 输出目录新增 `metrics_history.json`、`summary.json`、`split_info.json`
+
 ### v4.0 项目缺陷修复
 
 - `cross_attn_heads` 配置现已正确传递到模型（之前硬编码为 4）
 - `freeze_bert` 配置现已正确传递到模型
 - `n_know` 默认值统一为 64（之前三处不一致: yaml=64, 脚本 fallback=32, 模型 default=16）
+- `n_kc` 默认值按当前 XES 原始 skill id 空间对齐为 855，不再依赖运行时热修复
 - 删除无效配置项: `model.name`, `llm.llm_weight`, `llm.max_seq_length`, `gnn.graph_weight`, `gnn.dropout`, `gpu.primary_gpu`, `gpu.use_data_parallel`, `data.*`, `output.*`, `evaluation.*`
 - 修复 shell 脚本: test/baseline 等非 LLM 模式不再要求 embedding 文件
 - 修复在线 LLM fallback 路径: `prepare_bert_inputs` 在 list 包装前调用
 - 修复 LLM→ID fallback 维度不匹配: 退化为 `id_to_llm_proj(id_emb)` 输出 256 维
 - 修复预计算嵌入检查: `use_precomputed` 检查增加 `use_llm` 守卫，非 LLM 模式不检查
+- 修复预计算嵌入校验: 自动检查 `dataset_name` 元信息和 KC 覆盖，避免静默复用旧数据集工件
+- 修复训练评估链路: 无 `valid` 时从 train 生成验证集，`test.txt` 仅用于最终评估
 - 预计算脚本支持数据集参数: `python scripts/1_precompute.py [dataset]`，默认从 config 读取
 - DCFSimGraphEnhanced 标注为后处理工具类，不参与训练循环
 - pyproject.toml 依赖版本对齐 requirements.txt，修复拼写错误
 - 清理 config_loader.py 死代码 (TrainingConfig 类)
 - Makefile: `make test` → pytest 单测，新增 `make smoke-test` 训练冒烟测试
 
-### v4.0 Cross-Attention 融合
+### v4.0 Cross-Attention 融合（v4.1 延续）
 
 - `cross_attn_heads: 4`: Cross-Attention 头数，ID embedding 作为 Query attend LLM 语义特征
 - 门控残差: 2 层 gate network 输出标量，防止 attention 坍塌

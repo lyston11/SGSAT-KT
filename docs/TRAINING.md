@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v4.0** — Cross-Attention 融合: ID Query attend LLM 语义特征
+**v4.1** — 基于 v4.0 Cross-Attention 架构的训练/评估链路修订版
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -21,7 +21,7 @@
 | 重复嵌入 | max_repeats=20 (v3.1 新增) |
 | 学习率调度 | Cosine Annealing (v3.1 新增) |
 | 注意力头数 | 8 |
-| Cross-Attn 头数 | 4 (v4.0 新增) |
+| Cross-Attn 头数 | 4 (v4.0 新增, v4.1 延续) |
 
 ## 两段式训练
 
@@ -33,7 +33,7 @@
 ./scripts/2_train.sh full
 ```
 
-一键入口会自动检测嵌入维度是否匹配当前配置的模型，不匹配时自动重新预计算：
+一键入口会自动检测嵌入维度、数据集元信息和 KC 覆盖是否匹配当前配置，不匹配时自动重新预计算：
 ```bash
 ./scripts/train.sh full
 ```
@@ -42,13 +42,13 @@
 
 ### Embedding 阶段
 
-v4.0 采用 Cross-Attention 融合，ID embedding 作为 Query 主动 attend LLM 语义特征：
+v4.1 延续 v4.0 的 Cross-Attention 融合，ID embedding 作为 Query 主动 attend LLM 语义特征：
 
 ```
 # 多层投影（保留 v2.0 改进）
 llm_vec = pkl查表(2560) → Linear(2560→512)→GELU→LN→Linear(512→256)→LN
 
-# Cross-Attention 融合（v4.0 新增）
+# Cross-Attention 融合（v4.0 引入，v4.1 延续）
 id_proj = Linear(128→256)(ID_Embedding)      # ID 投影到同维度 (Query)
 attn_out = CrossAttn(Q=id_proj, K=llm_vec, V=llm_vec)  # ID Query attend LLM
 gate = gate_net(attn_out)                     # 2层gate→标量 [0,1]
@@ -61,8 +61,8 @@ q_emb = q_emb + GNN(kc_ids, edge_index)
 
 - **ID Embedding**: `nn.Embedding(n_questions+1, 128)` — 可学习的题目 ID 查表
 - **ID Dropout** (v3.0): 训练时 p=0.15 将 ID 置零，迫使模型依赖 LLM
-- **LLM Cross-Attention** (v4.0): ID embedding 作为 Query attend LLM Key/Value — 提取 task-specific 语义
-- **门控残差** (v4.0): 2 层 gate network (Linear→ReLU→Linear→Sigmoid) → 标量，防止 attention 坍塌
+- **LLM Cross-Attention** (v4.0+): ID embedding 作为 Query attend LLM Key/Value — 提取 task-specific 语义
+- **门控残差** (v4.0+): 2 层 gate network (Linear→ReLU→Linear→Sigmoid) → 标量，防止 attention 坍塌
 - **KC 融合门**: `W_p = nn.Linear(256, 256, bias=False)` — 知识点嵌入融合权重
 - **GNN**: `SimpleGCNLayer × 2` — 先决图消息传递，带残差 LayerNorm
 
@@ -107,7 +107,7 @@ loss = weighted_BCE + 0.05 * knowledge_consistency + reg_loss
 
 **完整模式** (full/prod, `cl_loss=True`):
 ```
-loss = weighted_BCE + lambda_cl * sequence_CL + lambda_contra * embedding_InfoNCE + reg_loss
+loss = weighted_BCE + 0.05 * knowledge_consistency + lambda_cl * sequence_CL + lambda_contra * embedding_InfoNCE + reg_loss
 ```
 
 - `weighted_BCE`: 错题权重 1.2 的二元交叉熵
@@ -115,6 +115,19 @@ loss = weighted_BCE + lambda_cl * sequence_CL + lambda_contra * embedding_InfoNC
 - `sequence_CL`: 序列增强 (随机交换) + 硬负样本 (翻转标签) 序列级对比学习，温度 0.05
 - `embedding_InfoNCE` (v3.0 新增): LLM 投影空间 in-batch 对比损失，同 KC 题目靠近，不同 KC 题目远离，温度 0.07
 - `reg_loss`: `p_diff^2 * 1e-3`（仅使用 pid 时）
+
+## 数据划分策略
+
+- 如果数据集提供 `valid`，训练过程使用该验证集做模型选择。
+- 如果数据集未提供 `valid`，训练脚本会按 `training.validation_ratio` 和 `training.validation_seed` 从 `train.txt` 中确定性切出验证集。
+- `test.txt` 仅在训练结束后对最佳验证模型做一次最终评估，不参与模型选择和早停。
+
+## 输出产物
+
+- `best_model.pt`: 最佳验证模型参数
+- `metrics_history.json`: 每个 epoch 的训练损失与验证指标
+- `summary.json`: 最佳验证结果、最终测试结果与 split 信息
+- `split_info.json`: 训练/验证划分策略与参数
 
 ## 可用模式
 
@@ -158,7 +171,16 @@ gnn:
 
 ## 版本历史
 
-### v4.0 (当前)
+### v4.1 (当前)
+- 延续 v4.0 的 Cross-Attention 融合与门控残差架构
+- 修复: `cl_loss=True` 时补回 knowledge_consistency 项，与文档定义一致
+- 修复: 无 `valid` 数据集时从 train 确定性生成验证集，`test.txt` 仅用于最终评估
+- 修复: 梯度累积按实际反向传播步数计数，兼容序列切块场景
+- 修复: 预计算嵌入增加 `dataset_name` 元信息，并校验 KC 覆盖
+- 修复: `use_llm=true` 时训练和验证阶段都一致构造 `kc_ids`
+- 新增: `metrics_history.json`、`summary.json`、`split_info.json` 输出
+
+### v4.0
 - Cross-Attention 融合: ID embedding 作为 Query attend LLM Key/Value，提取 task-specific 语义
 - 门控残差: 2 层 gate network 输出标量，防止 attention 坍塌
 - Causal Mask: 保持 KT 自回归特性
