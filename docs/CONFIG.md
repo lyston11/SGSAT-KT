@@ -141,6 +141,14 @@ llm:
 - 重复次数嵌入: `max_repeats=20`，建模题目重复出现次数（遗忘/强化信号）
 - Embedding dropout: 训练时对 q_emb/s_emb 施加 dropout 正则化
 
+### v4.2 XES 数据协议修复
+
+- 修复 `process_xes.py` 的项目根路径计算，重新对齐原始 `xes_math.csv`
+- 重新生成标准三行格式的 `xes/train.txt`、`xes/valid.txt`、`xes/test.txt`
+- `xes_question_texts.json` 中的 `skill` 现为 dense `kc_id`，同时保留 `raw_skill`
+- XES 当前配置更新为 `n_questions=7618`、`n_kc=865`
+- `train.sh` 增加 `q_count` 校验，旧的 `6530/828` embedding 会自动触发重算
+
 ### v4.1 项目缺陷修复
 
 - 训练/评估职责分离: 无 `valid` 时从 `train.txt` 生成验证集，`test.txt` 仅用于最终评估
@@ -168,7 +176,7 @@ llm:
 - 清理 config_loader.py 死代码 (TrainingConfig 类)
 - Makefile: `make test` → pytest 单测，新增 `make smoke-test` 训练冒烟测试
 
-### v4.0 Cross-Attention 融合（v4.1 延续）
+### v4.0 Cross-Attention 融合（v4.2 延续）
 
 - `cross_attn_heads: 4`: Cross-Attention 头数，ID embedding 作为 Query attend LLM 语义特征
 - 门控残差: 2 层 gate network 输出标量，防止 attention 坍塌

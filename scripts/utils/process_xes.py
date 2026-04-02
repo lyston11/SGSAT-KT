@@ -9,10 +9,11 @@ import argparse
 import numpy as np
 import pandas as pd
 from collections import defaultdict, Counter
+from pathlib import Path
 
 # 添加项目路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, os.pardir))
+project_root = os.path.abspath(os.path.join(current_dir, os.pardir, os.pardir))
 sys.path.insert(0, project_root)
 
 
@@ -22,6 +23,29 @@ def load_xes_data(file_path, max_rows=None):
     df = pd.read_csv(file_path, nrows=max_rows)
 
     print(f"✅ 加载完成")
+    print(f"   总记录数: {len(df):,}")
+    print(f"   题目数: {df['item_id'].nunique():,}")
+    print(f"   学生数: {df['user_id'].nunique():,}")
+    print(f"   知识点数: {df['skill_name'].nunique():,}")
+
+    return df
+
+
+def filter_xes_data(df):
+    """过滤无效记录，保证后续映射和训练数据一致。"""
+    required_columns = ["user_id", "item_id", "correct", "skill_name", "order_id"]
+    df = df.dropna(subset=required_columns).copy()
+    df = df[df["correct"].isin([0, 1])].copy()
+    df = df[df["skill_name"] != -1].copy()
+
+    # 规范类型，避免后续排序和映射不稳定
+    df["user_id"] = df["user_id"].astype(int)
+    df["item_id"] = df["item_id"].astype(int)
+    df["correct"] = df["correct"].astype(int)
+    df["skill_name"] = df["skill_name"].astype(int)
+    df["order_id"] = df["order_id"].astype(np.int64)
+
+    print(f"\n🧹 过滤后数据:")
     print(f"   总记录数: {len(df):,}")
     print(f"   题目数: {df['item_id'].nunique():,}")
     print(f"   学生数: {df['user_id'].nunique():,}")
@@ -56,8 +80,8 @@ def create_kc_mappings(df):
     return skill_to_kc, item_to_q, item_skills, n_skills, n_items
 
 
-def convert_to_sgsakt_format(df, output_file, skill_to_kc, item_to_q, max_seq_len=200):
-    """将XES数据转换为SGSAT-KT格式"""
+def convert_to_sgsakt_format(df, output_file, item_to_q, max_seq_len=200):
+    """将XES数据转换为标准 KT 格式: seq_len, q_ids, scores"""
     print(f"\n🔄 转换数据格式...")
 
     # 按学生分组
@@ -73,20 +97,17 @@ def convert_to_sgsakt_format(df, output_file, skill_to_kc, item_to_q, max_seq_le
 
         # 提取序列
         q_ids = [item_to_q[item_id] for item_id in group['item_id']]
-        kc_ids = [skill_to_kc[skill] for skill in group['skill_name']]
         scores = group['correct'].values
 
         # 如果序列太长，分割成多个子序列
         for i in range(0, len(q_ids), max_seq_len):
             q_seq = q_ids[i:i+max_seq_len]
-            kc_seq = kc_ids[i:i+max_seq_len]
             s_seq = scores[i:i+max_seq_len]
 
             if len(q_seq) >= 5:  # 至少5个题目
-                # 格式: seq_len, q_ids, kc_ids, scores
+                # 格式: seq_len, q_ids, scores
                 output_lines.append(str(len(q_seq)))
                 output_lines.append(','.join(map(str, q_seq)))
-                output_lines.append(','.join(map(str, kc_seq)))
                 output_lines.append(','.join(map(str, s_seq)))
 
         processed += 1
@@ -98,27 +119,35 @@ def convert_to_sgsakt_format(df, output_file, skill_to_kc, item_to_q, max_seq_le
         f.write('\n'.join(output_lines))
 
     print(f"✅ 转换完成，保存到: {output_file}")
-    print(f"   序列数量: {len(output_lines) // 4}")
+    print(f"   序列数量: {len(output_lines) // 3}")
 
 
-def split_train_test(df, train_ratio=0.8):
-    """分割训练集和测试集"""
-    # 按学生分割
+def split_train_valid_test(df, train_ratio=0.8, valid_ratio=0.1, seed=42):
+    """按学生划分 train/valid/test。"""
+    if train_ratio <= 0 or valid_ratio < 0 or train_ratio + valid_ratio >= 1:
+        raise ValueError("train_ratio 和 valid_ratio 配置非法")
+
     user_ids = df['user_id'].unique()
-    np.random.shuffle(user_ids)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(user_ids)
 
     n_train = int(len(user_ids) * train_ratio)
+    n_valid = int(len(user_ids) * valid_ratio)
+
     train_users = set(user_ids[:n_train])
-    test_users = set(user_ids[n_train:])
+    valid_users = set(user_ids[n_train:n_train + n_valid])
+    test_users = set(user_ids[n_train + n_valid:])
 
     train_df = df[df['user_id'].isin(train_users)]
+    valid_df = df[df['user_id'].isin(valid_users)]
     test_df = df[df['user_id'].isin(test_users)]
 
     print(f"\n📊 数据分割:")
     print(f"   训练集: {len(train_df):,} 记录 ({len(train_users)} 学生)")
+    print(f"   验证集: {len(valid_df):,} 记录 ({len(valid_users)} 学生)")
     print(f"   测试集: {len(test_df):,} 记录 ({len(test_users)} 学生)")
 
-    return train_df, test_df
+    return train_df, valid_df, test_df
 
 
 def build_prerequisite_graph(df, skill_to_kc, item_to_q, item_skills, min_cooccurrence=10):
@@ -170,7 +199,8 @@ def save_text_data(df, item_to_q, skill_to_kc, item_skills, output_dir):
     for item_id, q_id in item_to_q.items():
         skills = item_skills.get(item_id, [])
         if skills:
-            primary_skill = skills[0]
+            primary_skill = int(skills[0])
+            kc_id = int(skill_to_kc[primary_skill])
             # 使用实际的题目内容
             item_rows = df[df['item_id'] == item_id]
             if len(item_rows) > 0:
@@ -184,16 +214,19 @@ def save_text_data(df, item_to_q, skill_to_kc, item_skills, output_dir):
 
             question_texts[str(int(q_id))] = {
                 "content": content_clean,
-                "skill": str(primary_skill)
+                "skill": str(kc_id),
+                "raw_skill": str(primary_skill),
+                "item_id": str(int(item_id)),
             }
 
     # 为每个知识点生成文本
     kc_texts = {}
-    for skill_name, kc_id in skill_to_kc.items():
+    for raw_skill_name, kc_id in skill_to_kc.items():
         kc_id_int = int(kc_id)
         kc_texts[str(kc_id_int)] = {
-            "name": str(skill_name),
-            "description": f"知识点：{skill_name}"
+            "name": str(raw_skill_name),
+            "description": f"知识点：{raw_skill_name}",
+            "raw_skill": str(int(raw_skill_name)),
         }
 
     # 保存文本数据
@@ -216,11 +249,13 @@ def save_metadata(n_questions, n_kc, n_students, output_dir, dataset_name="xes")
     datasets_config = {
         "xes": {
             "train": "xes/train.txt",
+            "valid": "xes/valid.txt",
             "test": "xes/test.txt",
             "n_questions": n_questions,
             "n_pid": 0,
             "inputs": ["q", "s"],
-            "seq_len": 200
+            "seq_len": 200,
+            "has_text": True,
         }
     }
 
@@ -245,6 +280,12 @@ def main():
                         help='最大序列长度')
     parser.add_argument('--min_cooccurrence', type=int, default=10,
                         help='知识点共现最小次数（用于构建先决图）')
+    parser.add_argument('--train_ratio', type=float, default=0.8,
+                        help='训练集用户比例')
+    parser.add_argument('--valid_ratio', type=float, default=0.1,
+                        help='验证集用户比例')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子')
 
     args = parser.parse_args()
 
@@ -257,22 +298,30 @@ def main():
 
     # 1. 加载数据
     df = load_xes_data(input_path, args.max_rows)
+    df = filter_xes_data(df)
 
     # 2. 创建映射
     skill_to_kc, item_to_q, item_skills, n_skills, n_items = create_kc_mappings(df)
 
     # 3. 分割训练集和测试集
-    train_df, test_df = split_train_test(df)
+    train_df, valid_df, test_df = split_train_valid_test(
+        df,
+        train_ratio=args.train_ratio,
+        valid_ratio=args.valid_ratio,
+        seed=args.seed,
+    )
 
     # 4. 转换为SGSAT-KT格式
     train_output = os.path.join(output_dir, "xes", "train.txt")
+    valid_output = os.path.join(output_dir, "xes", "valid.txt")
     test_output = os.path.join(output_dir, "xes", "test.txt")
 
     # 确保输出目录存在
     os.makedirs(os.path.dirname(train_output), exist_ok=True)
 
-    convert_to_sgsakt_format(train_df, train_output, skill_to_kc, item_to_q, args.max_seq_len)
-    convert_to_sgsakt_format(test_df, test_output, skill_to_kc, item_to_q, args.max_seq_len)
+    convert_to_sgsakt_format(train_df, train_output, item_to_q, args.max_seq_len)
+    convert_to_sgsakt_format(valid_df, valid_output, item_to_q, args.max_seq_len)
+    convert_to_sgsakt_format(test_df, test_output, item_to_q, args.max_seq_len)
 
     # 5. 构建先决图
     edge_index = build_prerequisite_graph(train_df, skill_to_kc, item_to_q, item_skills, args.min_cooccurrence)
@@ -293,7 +342,7 @@ def main():
 
     # 6. 保存文本数据
     text_output_dir = os.path.join(output_dir, "text_data")
-    save_text_data(train_df, item_to_q, skill_to_kc, item_skills, text_output_dir)
+    save_text_data(df, item_to_q, skill_to_kc, item_skills, text_output_dir)
 
     # 7. 保存元数据
     save_metadata(n_items, n_skills, df['user_id'].nunique(), output_dir)
@@ -306,8 +355,8 @@ def main():
     print(f"   知识点数量: {n_skills:,}")
     print(f"   学生数量: {df['user_id'].nunique():,}")
     print(f"\n💡 使用方法:")
-    print(f"   python scripts/train_fixed.py -d xes -n 100 --use_gnn --use_llm --cl_loss")
-    print(f"   --pretrained_model {os.path.join(project_root, 'pretrained_models/bert-base-chinese')}")
+    print(f"   ./scripts/1_precompute.sh")
+    print(f"   ./scripts/train.sh full")
 
 
 if __name__ == '__main__':

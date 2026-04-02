@@ -20,7 +20,7 @@ sys.path.insert(0, project_root)
 # 导入配置加载器
 from scripts.utils.config_loader import ConfigLoader
 
-from DTransformer.data import KTData, transform_batch
+from DTransformer.data import Batch, KTData, transform_batch
 from DTransformer.eval import Evaluator
 from DTransformer.model import DTransformer
 from DTransformer.embedding_loader import PrecomputedEmbeddings
@@ -248,17 +248,200 @@ class KTDataSubset:
         return len(self.indices)
 
 
+class FlexibleKTData:
+    """兼容两类序列文件:
+    1. 标准格式: 每个样本独立的 seq_len + fields
+    2. 混合格式: 首行/中间行为全局 seq_len，后续连续 fields 行
+    """
+
+    def __init__(self, data_path, inputs, batch_size=1, seq_len=None, shuffle=False):
+        self.inputs = inputs
+        self.seq_len = seq_len
+        self.samples = parse_flexible_kt_samples(data_path, inputs)
+        self.loader = DataLoader(
+            self,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=transform_batch,
+            num_workers=0,
+        )
+
+    def __iter__(self):
+        return iter(self.loader)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        return Batch(
+            torch.tensor(self.samples[index], dtype=torch.long),
+            self.inputs,
+            self.seq_len,
+        )
+
+
+def is_seq_len_header(line):
+    line = line.strip()
+    return bool(line) and "," not in line and line.isdigit()
+
+
+def is_binary_like_line(line, expected_len=None):
+    if "," not in line:
+        return False
+    values = [int(x) for x in line.split(',')]
+    if expected_len is not None and len(values) != expected_len:
+        return False
+    return all(v in (-1, 0, 1) for v in values)
+
+
+def sniff_data_format(data_path, inputs, preview_groups=8):
+    """检测当前数据文件是否符合 KTData 的固定 group 读取假设。"""
+    with open(data_path, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    group = len(inputs) + 1
+    if len(lines) < group:
+        return {
+            "use_flexible": False,
+            "reason": "file_too_small",
+        }
+
+    for group_idx in range(min(preview_groups, len(lines) // group)):
+        start = group_idx * group
+        header = lines[start]
+        if not is_seq_len_header(header):
+            return {
+                "use_flexible": True,
+                "reason": f"group_{group_idx}_header_not_seq_len",
+            }
+        seq_len = int(header)
+        field_lines = lines[start + 1:start + group]
+        if len(field_lines) != len(inputs):
+            return {
+                "use_flexible": True,
+                "reason": f"group_{group_idx}_field_count_mismatch",
+            }
+        field_lens = [len(line.split(',')) for line in field_lines]
+        if any(field_len != seq_len for field_len in field_lens):
+            return {
+                "use_flexible": True,
+                "reason": f"group_{group_idx}_field_len_mismatch_{field_lens}_seq_{seq_len}",
+            }
+
+    return {
+        "use_flexible": False,
+        "reason": "standard_group_format",
+    }
+
+
+def parse_flexible_kt_samples(data_path, inputs):
+    """解析带有全局/局部 seq_len 头的序列文件。"""
+    with open(data_path, 'r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    samples = []
+    idx = 0
+    current_seq_len = None
+    malformed = 0
+
+    while idx < len(lines):
+        line = lines[idx]
+
+        if is_seq_len_header(line):
+            current_seq_len = int(line)
+            idx += 1
+            continue
+
+        if current_seq_len is None:
+            raise ValueError(f"{data_path}: 在行 {idx + 1} 之前未找到 seq_len 头")
+
+        # 优先解析 q,s 成对格式；若检测到中间存在 kc 行，则解析 q,kc,s 三元格式
+        if idx + 1 < len(lines):
+            q_line = lines[idx]
+            s_line = lines[idx + 1]
+            if (
+                "," in q_line
+                and "," in s_line
+                and not is_seq_len_header(s_line)
+            ):
+                q_values = [int(x) for x in q_line.split(',')]
+                s_values = [int(x) for x in s_line.split(',')]
+                if (
+                    len(q_values) == current_seq_len
+                    and len(s_values) == current_seq_len
+                    and is_binary_like_line(s_line, current_seq_len)
+                ):
+                    samples.append([q_values, s_values])
+                    idx += 2
+                    continue
+
+        if idx + 2 < len(lines):
+            q_line = lines[idx]
+            kc_line = lines[idx + 1]
+            s_line = lines[idx + 2]
+            if (
+                "," in q_line
+                and "," in kc_line
+                and "," in s_line
+                and not is_seq_len_header(kc_line)
+                and not is_seq_len_header(s_line)
+            ):
+                q_values = [int(x) for x in q_line.split(',')]
+                s_values = [int(x) for x in s_line.split(',')]
+                if (
+                    len(q_values) == current_seq_len
+                    and len(s_values) == current_seq_len
+                    and is_binary_like_line(s_line, current_seq_len)
+                ):
+                    samples.append([q_values, s_values])
+                    idx += 3
+                    continue
+
+        malformed += 1
+        idx += 1
+
+    if not samples:
+        raise ValueError(f"{data_path}: 未解析出任何有效样本")
+
+    if malformed:
+        print(f"⚠️  使用兼容解析器加载 {data_path} 时跳过了 {malformed} 处异常片段")
+
+    return samples
+
+
+def build_data_source(data_path, inputs, batch_size, seq_len=None, shuffle=False):
+    """根据文件格式自动选择 KTData 或兼容解析器。"""
+    format_info = sniff_data_format(data_path, inputs)
+    if format_info["use_flexible"]:
+        print(f"⚠️  检测到非标准序列文件格式，启用兼容解析器: {data_path} ({format_info['reason']})")
+        return FlexibleKTData(
+            data_path,
+            inputs,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            shuffle=shuffle,
+        )
+
+    return KTData(
+        data_path,
+        inputs,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        shuffle=shuffle,
+    )
+
+
 def build_generated_valid_split(train_path, inputs, seq_len, train_batch_size,
                                 eval_batch_size, valid_ratio=0.1, seed=42):
     """当数据集未提供 valid 划分时，从 train 中确定性切出验证集。"""
     if not (0.0 < valid_ratio < 1.0):
         raise ValueError(f"validation_ratio 必须在 (0,1) 内，当前为 {valid_ratio}")
 
-    base_data = KTData(
+    base_data = build_data_source(
         train_path,
         inputs,
-        seq_len=seq_len,
         batch_size=1,
+        seq_len=seq_len,
         shuffle=False,
     )
     n_samples = len(base_data)
@@ -636,18 +819,19 @@ def main():
     split_info = None
 
     if "valid" in dataset_config:
-        train_data = KTData(
+        train_data = build_data_source(
             train_path,
             dataset_config["inputs"],
-            seq_len=seq_len,
             batch_size=batch_size,
+            seq_len=seq_len,
             shuffle=True,
         )
-        valid_data = KTData(
+        valid_data = build_data_source(
             os.path.join(data_dir, dataset_config["valid"]),
             dataset_config["inputs"],
-            seq_len=seq_len,
             batch_size=test_batch_size,
+            seq_len=seq_len,
+            shuffle=False,
         )
         split_info = {
             "source": "provided_files",
@@ -674,11 +858,12 @@ def main():
     # 独立测试集（训练中不使用，仅在训练结束后做最终评估）
     test_data = None
     if "test" in dataset_config:
-        test_data = KTData(
+        test_data = build_data_source(
             os.path.join(data_dir, dataset_config["test"]),
             dataset_config["inputs"],
-            seq_len=seq_len,
             batch_size=test_batch_size,
+            seq_len=seq_len,
+            shuffle=False,
         )
 
     config['validation_split_info'] = split_info

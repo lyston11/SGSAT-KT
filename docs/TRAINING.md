@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v4.1** — 基于 v4.0 Cross-Attention 架构的训练/评估链路修订版
+**v4.2** — 基于 v4.0 Cross-Attention 架构的训练/评估链路与 XES 数据协议修订版
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -42,13 +42,13 @@
 
 ### Embedding 阶段
 
-v4.1 延续 v4.0 的 Cross-Attention 融合，ID embedding 作为 Query 主动 attend LLM 语义特征：
+v4.2 延续 v4.0 的 Cross-Attention 融合，ID embedding 作为 Query 主动 attend LLM 语义特征：
 
 ```
 # 多层投影（保留 v2.0 改进）
 llm_vec = pkl查表(2560) → Linear(2560→512)→GELU→LN→Linear(512→256)→LN
 
-# Cross-Attention 融合（v4.0 引入，v4.1 延续）
+# Cross-Attention 融合（v4.0 引入，v4.2 延续）
 id_proj = Linear(128→256)(ID_Embedding)      # ID 投影到同维度 (Query)
 attn_out = CrossAttn(Q=id_proj, K=llm_vec, V=llm_vec)  # ID Query attend LLM
 gate = gate_net(attn_out)                     # 2层gate→标量 [0,1]
@@ -122,6 +122,12 @@ loss = weighted_BCE + 0.05 * knowledge_consistency + lambda_cl * sequence_CL + l
 - 如果数据集未提供 `valid`，训练脚本会按 `training.validation_ratio` 和 `training.validation_seed` 从 `train.txt` 中确定性切出验证集。
 - `test.txt` 仅在训练结束后对最佳验证模型做一次最终评估，不参与模型选择和早停。
 
+## 数据读取兼容性
+
+- `2_train.py` 默认按标准 KT 文件格式读取数据。
+- v4.2 重建后的 XES 数据已经恢复为标准三行格式。
+- 兼容解析器仍然保留，用于排查历史异常文件；若检测到旧的非标准文件布局，训练脚本会自动启用兼容解析器而不修改原始 `data/` 文件。
+
 ## 输出产物
 
 - `best_model.pt`: 最佳验证模型参数
@@ -171,7 +177,15 @@ gnn:
 
 ## 版本历史
 
-### v4.1 (当前)
+### v4.2 (当前)
+- 修复: `process_xes.py` 项目根路径计算错误，恢复从原始 `xes_math.csv` 正确读取数据
+- 修复: 重建 XES `train/valid/test` 为标准 `seq_len + q + s` 三行格式
+- 修复: XES 文本数据中的 `skill` 改为 dense `kc_id`，并保留 `raw_skill`
+- 更新: XES 当前数据协议下使用 `7618` 个题目、`865` 个知识点
+- 修复: `train.sh` 增加 `q_count` 校验，旧 embedding 工件会自动触发重算
+- 保留: 兼容解析器仅作为历史异常文件兜底，不再依赖它作为正常训练路径
+
+### v4.1
 - 延续 v4.0 的 Cross-Attention 融合与门控残差架构
 - 修复: `cl_loss=True` 时补回 knowledge_consistency 项，与文档定义一致
 - 修复: 无 `valid` 数据集时从 train 确定性生成验证集，`test.txt` 仅用于最终评估

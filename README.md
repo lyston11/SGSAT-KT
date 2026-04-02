@@ -2,7 +2,7 @@
 
 基于 SATKT (Sparse Attention Knowledge Tracing) 框架，融合 LLM 语义嵌入和 GNN 知识点先决图的知识追踪模型。
 
-**当前版本**: v4.1 (基于 v4.0 Cross-Attention 架构的训练/评估链路修订版)
+**当前版本**: v4.2 (基于 v4.0 Cross-Attention 架构的训练/评估链路与 XES 数据协议修订版)
 
 ---
 
@@ -59,6 +59,17 @@ v3.0 三项改进:
 2. **辅助 InfoNCE 对比损失**: 在 LLM 投影空间施加 in-batch 对比损失，同 KC 题目的投影靠近，不同 KC 题目远离，强制 LLM 信号结构化
 3. **ID Dropout** (p=0.15): 训练时随机将 ID embedding 置零，迫使模型更多依赖 LLM 信号
 
+### v4.2 改进
+
+v4.2 在 v4.1 的训练链路修复基础上，重点重建了 XES 数据预处理协议，确保数据、文本、图结构和预计算 embedding 使用同一套编号体系：
+
+1. **XES 预处理重构**: 修复 `process_xes.py` 的项目根路径计算和输出协议，重新生成标准 `seq_len + q + s` 三行格式的 `train/valid/test`
+2. **XES 数据划分重建**: 按学生级别稳定划分 `train/valid/test`，避免历史混合格式文件导致训练中途崩溃
+3. **Dense KC 映射对齐**: `xes_question_texts.json` 中的 `skill` 改为 dense `kc_id`，并保留 `raw_skill` 便于追溯
+4. **XES 规模更新**: 当前干净数据协议下，XES 使用 `7618` 个题目和 `865` 个知识点
+5. **预计算重建触发条件补强**: `train.sh` 新增 `q_count` 校验，旧的 `6530/828` embedding 工件会被自动判定为需要重算
+6. **兼容解析保留**: `2_train.py` 仍保留对旧异常文件的兼容解析，便于排查历史产物
+
 ### v4.1 改进
 
 v4.1 在 v4.0 Cross-Attention 融合架构基础上，重点修复训练协议、预计算嵌入校验和实验复现链路：
@@ -92,13 +103,13 @@ v4.0 改进:
 │                                      按固定随机种子切出验证集，test.txt 仅用于最终评估
 ├── xes_question_texts.json          → 题目文本 (content + skill)
 ├── xes_kc_texts.json                → 知识点文本
-├── question_embeddings.pkl          → 预计算嵌入 (6530 × 2560)
-├── kc_embeddings.pkl                → 预计算嵌入 (812 × 2560)
+├── question_embeddings.pkl          → 预计算嵌入 (7618 × 2560)
+├── kc_embeddings.pkl                → 预计算嵌入 (865 × 2560)
 └── xes_edge_index.npy               → 知识点先决图 (19506 条边)
     │
     ↓ DataLoader: Batch(q:[B,200], s:[B,200])
     │
-Embedding 阶段 (v4.1)
+Embedding 阶段 (v4.2)
     q_id → Embedding(n_q+1, id_dim=128)      → id_emb [B,L,128]
     q_id → pkl查表(2560) → Linear(2560→512)→GELU→LN→Linear(512→256)→LN → e_q [B,L,256]
     kc_id → pkl查表(2560) → 同样多层投影(独立权重) → e_kc [B,L,256]
@@ -138,7 +149,7 @@ Transformer 主干
 | 阶段 | 形状 |
 |------|------|
 | DataLoader 输出 | `q: (B, 200)`, `s: (B, 200)` |
-| 预计算嵌入查表 | `(6530, 2560)` |
+| 预计算嵌入查表 | `(7618, 2560)` |
 | 多层投影后 | `(B, L, 256)` |
 | 门控融合后 | `(B, L, 256)` |
 | Transformer 输出 | `(B, L, 256)` |

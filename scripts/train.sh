@@ -47,10 +47,12 @@ with open('data/embeddings/kc_embeddings.pkl', 'rb') as f:
     kc_data = pickle.load(f)
 
 required_kc = set()
+expected_q_count = None
 text_path = Path('data/text_data') / f'{dataset}_question_texts.json'
 if text_path.exists():
     with text_path.open(encoding='utf-8') as f:
         q_texts = json.load(f)
+    expected_q_count = len(q_texts)
     for info in q_texts.values():
         skill = info.get('skill', '-1')
         try:
@@ -71,6 +73,8 @@ print(
             str(model_path),
             str(q_data.get('dataset_name', '')),
             str(kc_data.get('dataset_name', '')),
+            str(len(q_data.get('question_ids', []))),
+            str(expected_q_count if expected_q_count is not None else ''),
             str(len(missing_kc)),
         ]
     )
@@ -82,8 +86,10 @@ PY
         CONFIG_MODEL=$(echo "$EMBED_INFO" | cut -d'|' -f3)
         EMBED_Q_DATASET=$(echo "$EMBED_INFO" | cut -d'|' -f4)
         EMBED_KC_DATASET=$(echo "$EMBED_INFO" | cut -d'|' -f5)
-        MISSING_KC_COUNT=$(echo "$EMBED_INFO" | cut -d'|' -f6)
-        echo "📊 当前嵌入: 模型=$EMBED_MODEL, 维度=$EMBED_HIDDEN, q_dataset=${EMBED_Q_DATASET:-<missing>}, kc_dataset=${EMBED_KC_DATASET:-<missing>}"
+        EMBED_Q_COUNT=$(echo "$EMBED_INFO" | cut -d'|' -f6)
+        EXPECTED_Q_COUNT=$(echo "$EMBED_INFO" | cut -d'|' -f7)
+        MISSING_KC_COUNT=$(echo "$EMBED_INFO" | cut -d'|' -f8)
+        echo "📊 当前嵌入: 模型=$EMBED_MODEL, 维度=$EMBED_HIDDEN, q_dataset=${EMBED_Q_DATASET:-<missing>}, kc_dataset=${EMBED_KC_DATASET:-<missing>}, q_count=$EMBED_Q_COUNT"
         echo "📄 配置模型: $CONFIG_MODEL"
 
         # 通过实际加载模型获取真实维度来校验
@@ -118,6 +124,9 @@ print(cfg.get('training', {}).get('dataset', 'xes'))
 PY
 )" ]; then
             echo "⚠️  预计算嵌入数据集与当前配置不一致"
+            NEED_PRECOMPUTE=true
+        elif [ -n "$EXPECTED_Q_COUNT" ] && [ "$EMBED_Q_COUNT" != "$EXPECTED_Q_COUNT" ]; then
+            echo "⚠️  题目嵌入数量($EMBED_Q_COUNT)与当前文本数据期望数量($EXPECTED_Q_COUNT)不一致"
             NEED_PRECOMPUTE=true
         elif [ "$MISSING_KC_COUNT" != "0" ]; then
             echo "⚠️  检测到 $MISSING_KC_COUNT 个被题目引用的 KC 缺少预计算嵌入"

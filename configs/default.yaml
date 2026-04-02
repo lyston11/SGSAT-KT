@@ -28,7 +28,7 @@ llm:
 # Innovation 2: GNN Prerequisite Graph
 gnn:
   use_gnn: true
-  n_kc: 855
+  n_kc: 865
   gnn_layers: 2
 
 # Innovation 3: 对比学习 + DCF-Sim 后处理工具
