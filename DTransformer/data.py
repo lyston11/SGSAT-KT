@@ -2,6 +2,7 @@ import linecache
 import math
 import subprocess
 import sys
+from numbers import Integral
 
 import torch
 from torch.utils.data import DataLoader
@@ -116,7 +117,8 @@ class Lines:
 
     def __getitem__(self, item):
         d = self.skip + 1
-        if isinstance(item, int):
+        if isinstance(item, Integral):
+            item = int(item)
             if item < len(self):
                 if self.group == 1:
                     line = linecache.getline(self.filename, item + d)

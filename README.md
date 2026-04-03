@@ -2,10 +2,10 @@
 
 `TriSG-KT` 是当前论文中使用的正式模型名，对应“`TriSA-Backbone` 原创序列主干 + 语义增强 + 先决图增强 + 多约束协同优化”的完整知识追踪模型。
 
-**当前版本**: v4.3  
+**当前版本**: v4.2
 详细版本记录见 [训练指南](docs/TRAINING.md)
 
-`v4.3` 聚焦工程化解耦与运行链路模块化，不改变 `TriSA-Backbone + SSA + GNN + MCO` 的方法定义，只重构训练、预计算、数据解析和文档组织边界。
+当前 `v4.2` 已包含方法版定型后的工程化补充：训练/预计算链路解耦、多数据集工件隔离、官方 `DTransformer` 基线接入、`pykt` 基线统一封装，以及新的运行输出目录组织方式。
 
 ---
 
@@ -171,7 +171,7 @@ make smoke-test  # 训练冒烟测试 (5轮快速验证)
 
 ```
 <repo_root>/
-├── baselines/               # 对比基线 (AKT, DKT, DKVMN, SAKT)
+├── baselines/               # 对比基线封装（官方 DTransformer + pykt 基线适配）
 ├── configs/
 │   └── default.yaml         # 唯一配置来源
 ├── DTransformer/            # 核心模型代码
@@ -207,7 +207,7 @@ make smoke-test  # 训练冒烟测试 (5轮快速验证)
 │   └── metrics.py           # 通用评估工具
 ├── data/                    # 数据文件 (只读)
 ├── pretrained_models/       # 预训练模型权重 (只读)
-├── output/                  # 训练输出 (自动生成)
+├── output/                  # 训练输出 (自动生成, 新 run 写入 output/runs/)
 └── logs/                    # 训练日志 (自动生成)
 ```
 
@@ -233,6 +233,28 @@ make smoke-test  # 训练冒烟测试 (5轮快速验证)
 - `utils/embedding_artifacts.py` 统一处理文本/图/embedding 工件加载和校验
 - `utils/data_pipeline.py` 退化为训练侧兼容入口
 - `utils/training.py` 统一处理训练/验证循环、设备初始化和结果持久化
+
+## 输出目录
+
+新的训练运行会写入：
+
+```text
+output/
+  runs/
+    {dataset}/
+      {mode}/
+        {date}/
+          {time}_{tag}/
+            artifacts/
+            metrics/
+            meta/
+```
+
+- `artifacts/`：模型权重，如 `best_model.pt`
+- `metrics/`：训练曲线和结果摘要，如 `metrics_history.json`、`summary.json`
+- `meta/`：运行配置和元信息，如 `config.json`、`split_info.json`、`run_info.json`
+
+`run_info.json` 会记录本次运行的 `status`、开始时间、Git 提交、数据集和模式，便于区分 `running / completed / failed / interrupted`。
 - `utils/preprocessing.py` 统一处理序列解析、最小文本生成和先决图构建
 - `utils/precompute.py` 统一处理预计算模型解析、文本工件读取和 embedding 生成
 - `scripts/2_train.py` 与 `DTransformer/preprocess_data.py` 逐步收敛为 CLI 编排入口

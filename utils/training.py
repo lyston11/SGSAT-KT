@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from datetime import datetime
 
 import torch
@@ -18,6 +19,103 @@ def _move_optional_tensor(value, device):
     if value is None:
         return None
     return value.to(device) if isinstance(value, torch.Tensor) else value
+
+
+def _to_jsonable(value):
+    if isinstance(value, dict):
+        return {key: _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(payload), f, indent=2, ensure_ascii=False)
+
+
+def _read_json(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _slugify_tag(value):
+    if not value:
+        return "default"
+    safe = []
+    for ch in str(value):
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            safe.append(ch)
+        else:
+            safe.append("-")
+    tag = "".join(safe).strip("-_.")
+    return tag or "default"
+
+
+def resolve_output_paths(output_dir):
+    artifacts_dir = os.path.join(output_dir, "artifacts")
+    metrics_dir = os.path.join(output_dir, "metrics")
+    meta_dir = os.path.join(output_dir, "meta")
+    return {
+        "root": output_dir,
+        "artifacts_dir": artifacts_dir,
+        "metrics_dir": metrics_dir,
+        "meta_dir": meta_dir,
+        "best_model": os.path.join(artifacts_dir, "best_model.pt"),
+        "metrics_history": os.path.join(metrics_dir, "metrics_history.json"),
+        "summary": os.path.join(metrics_dir, "summary.json"),
+        "config": os.path.join(meta_dir, "config.json"),
+        "split_info": os.path.join(meta_dir, "split_info.json"),
+        "run_info": os.path.join(meta_dir, "run_info.json"),
+    }
+
+
+def update_run_status(output_paths, status, **extra_fields):
+    if output_paths is None:
+        return
+    run_info_path = output_paths["run_info"]
+    payload = _read_json(run_info_path)
+    payload["status"] = status
+    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    payload.update(_to_jsonable(extra_fields))
+    if status in {"completed", "failed", "interrupted"} and not payload.get("ended_at"):
+        payload["ended_at"] = payload["updated_at"]
+    _write_json(run_info_path, payload)
+
+
+def _resolve_git_revision(project_root):
+    try:
+        commit = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=project_root,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        commit = None
+    try:
+        branch = (
+            subprocess.check_output(
+                ["git", "branch", "--show-current"],
+                cwd=project_root,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        branch = None
+    return commit, branch
 
 
 def build_batch_views(batch, config, q_texts=None, tokenizer=None, q_to_kc_mapping=None):
@@ -204,11 +302,15 @@ def validate(
             for batch_view in batch_views:
                 q, s, pid, current_kc_ids, current_q_text = move_batch_view_to_device(batch_view, device)
                 model_to_use = _unwrap_model(model)
+                eval_shift = int(getattr(model_to_use, "_eval_shift", 0))
                 with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                     y, *_ = model_to_use.predict(
                         q, s, pid, current_kc_ids, edge_index, current_q_text, None
                     )
-                evaluator.evaluate(s, torch.sigmoid(y))
+                if eval_shift > 0:
+                    evaluator.evaluate(s[:, eval_shift:], torch.sigmoid(y))
+                else:
+                    evaluator.evaluate(s, torch.sigmoid(y))
 
     return evaluator.report()
 
@@ -279,33 +381,65 @@ def initialize_runtime(model, config, baseline_name=None, edge_index=None):
 
 def create_output_dir(project_root, mode, dataset_name, config, split_info):
     if not config.get("training_save_model", config.get("save_model", True)):
-        return None
+        return None, None
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(project_root, f"output/{mode}_{dataset_name}_{timestamp}")
-    os.makedirs(output_dir, exist_ok=True)
+    now = datetime.now()
+    date_part = now.strftime("%Y-%m-%d")
+    time_part = now.strftime("%H%M%S")
+    model_tag = _slugify_tag(
+        os.path.basename(config.get("pretrained_model", "default"))
+        if config.get("use_llm", False)
+        else "no-llm"
+    )
+    run_tag = f"{time_part}_{model_tag}"
+    output_dir = os.path.join(
+        project_root,
+        "output",
+        "runs",
+        dataset_name,
+        mode,
+        date_part,
+        run_tag,
+    )
+    output_paths = resolve_output_paths(output_dir)
+    for key in ("root", "artifacts_dir", "metrics_dir", "meta_dir"):
+        os.makedirs(output_paths[key], exist_ok=True)
 
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-    with open(os.path.join(output_dir, "split_info.json"), "w", encoding="utf-8") as f:
-        json.dump(split_info, f, indent=2)
+    _write_json(output_paths["config"], config)
+    _write_json(output_paths["split_info"], split_info)
+    git_commit, git_branch = _resolve_git_revision(project_root)
+    _write_json(
+        output_paths["run_info"],
+        {
+            "run_id": f"{dataset_name}/{mode}/{date_part}/{run_tag}",
+            "dataset": dataset_name,
+            "mode": mode,
+            "date": date_part,
+            "run_tag": run_tag,
+            "status": "running",
+            "started_at": now.isoformat(timespec="seconds"),
+            "updated_at": now.isoformat(timespec="seconds"),
+            "git_commit": git_commit,
+            "git_branch": git_branch,
+            "output_dir": os.path.relpath(output_dir, project_root),
+        },
+    )
 
     print(f"📁 输出目录: {output_dir}")
-    return output_dir
+    return output_dir, output_paths
 
 
 def save_metrics_history(history_path, history):
     if history_path is None:
         return
-    with open(history_path, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
+    _write_json(history_path, history)
 
 
 def save_best_model(model, output_dir):
     if output_dir is None:
         return None
 
-    model_path = os.path.join(output_dir, "best_model.pt")
+    model_path = resolve_output_paths(output_dir)["best_model"]
     state_dict = _unwrap_model(model).state_dict()
     torch.save(state_dict, model_path)
     print(f"💾 保存最佳模型: {model_path}")
@@ -316,7 +450,7 @@ def load_best_model_if_available(model, output_dir, device):
     if output_dir is None:
         return None
 
-    model_path = os.path.join(output_dir, "best_model.pt")
+    model_path = resolve_output_paths(output_dir)["best_model"]
     if not os.path.exists(model_path):
         return None
 
@@ -329,14 +463,12 @@ def load_best_model_if_available(model, output_dir, device):
 def save_training_summary(summary_path, best_epoch, best, test_results, split_info):
     if summary_path is None:
         return
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "best_epoch": best_epoch,
-                "best_valid": best,
-                "test": test_results,
-                "split_info": split_info,
-            },
-            f,
-            indent=2,
-        )
+    _write_json(
+        summary_path,
+        {
+            "best_epoch": best_epoch,
+            "best_valid": best,
+            "test": test_results,
+            "split_info": split_info,
+        },
+    )

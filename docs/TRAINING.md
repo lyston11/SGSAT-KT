@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v4.3** — 基于 v4.2 方法定义的工程化解耦、多数据集流程整理与文档收口版
+**v4.2** — 当前稳定版本；在 `TriSA-Backbone + SSA + GNN + MCO` 方法定义保持不变的前提下，持续吸收数据协议修复、工程化解耦、多数据集流程整理和对比基线补充
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -144,7 +144,7 @@ MLP 结构: `Linear(512→256) → GELU → Dropout → Linear(256→128) → GE
 
 ### MCO 多约束协同目标
 
-**标准模式** (baseline/test):
+**标准模式** (dtransformer/test):
 ```
 loss = weighted_BCE + 0.05 * knowledge_consistency + reg_loss
 ```
@@ -175,17 +175,27 @@ loss = weighted_BCE + 0.05 * knowledge_consistency + lambda_cl * sequence_CL + l
 
 ## 输出产物
 
-- `best_model.pt`: 最佳验证模型参数
-- `metrics_history.json`: 每个 epoch 的训练损失与验证指标
-- `summary.json`: 最佳验证结果、最终测试结果与 split 信息
-- `split_info.json`: 训练/验证划分策略与参数
+新训练运行默认写入：
+
+```text
+output/runs/{dataset}/{mode}/{date}/{time_tag}/
+```
+
+其中：
+
+- `artifacts/best_model.pt`: 最佳验证模型参数
+- `metrics/metrics_history.json`: 每个 epoch 的训练损失与验证指标
+- `metrics/summary.json`: 最佳验证结果、最终测试结果与 split 信息
+- `meta/config.json`: 本次运行展开后的配置
+- `meta/split_info.json`: 训练/验证划分策略与参数
+- `meta/run_info.json`: 运行状态、开始时间、Git 提交、dataset/mode 等元信息
 
 ## 可用模式
 
 | 模式 | 命令 | 说明 | LLM | GNN | CL | 轮数 |
 |------|------|------|-----|-----|-----|------|
 | `test` | `./scripts/2_train.sh test` | 快速验证 | OFF | OFF | OFF | 5 |
-| `baseline` | `./scripts/2_train.sh baseline` | 基线 | OFF | OFF | OFF | 100 |
+| `dtransformer` | `./scripts/2_train.sh dtransformer` | 官方 DTransformer 基线 | OFF | OFF | OFF | 100 |
 | `full` | `./scripts/2_train.sh full` | 完整模型 | ON | ON | ON | 30 |
 | `prod` | `./scripts/2_train.sh prod` | 生产环境 | ON | ON | OFF | 200 |
 | `sakt` | `./scripts/2_train.sh sakt` | SAKT 基线 | OFF | OFF | OFF | 100 |
@@ -224,63 +234,6 @@ gnn:
 
 本节是项目唯一正式版本记录入口。  
 训练协议、数据协议、脚本行为变化、工程化重构和版本演化，统一维护在本文件中。
-
-### v4.3（当前）
-
-版本定位：  
-`v4.3` 不改变 `TriSG-KT` 的模型数学定义、主干结构和联合优化目标，重点对工程实现、运行链路、模块边界和文档入口做系统收敛。
-
-#### 设计目标
-
-- 降低训练脚本、预计算脚本、模型组件之间的耦合
-- 让 `scripts/` 入口只负责编排，把公共逻辑沉到 `utils/` 与 `DTransformer/` 子模块
-- 支持多数据集预处理、预计算和训练流程更稳定地并行运行
-- 统一版本历史入口，避免文档职责重叠
-
-#### 工程化与模块化重构
-
-- 将训练/验证循环、设备初始化、AMP 逻辑、最佳模型保存、指标历史落盘、训练总结落盘，从训练脚本中抽离到 `utils/training.py`
-- 将 `scripts/2_train.py` 收敛为训练编排入口，主要保留模式解析、配置加载、数据准备、模型构建和训练调度
-- 将 KT 序列标准解析、异常历史格式兼容解析、训练内验证集切分逻辑抽离到 `utils/kt_dataset.py`
-- 将文本工件、先决图工件、预计算 embedding 工件的读取与校验逻辑抽离到 `utils/embedding_artifacts.py`
-- `utils/data_pipeline.py` 退化为训练侧兼容聚合入口，只保留 batch 级辅助函数和对外稳定接口
-- 将预计算模型路径解析、文本工件读取、KC 文本回填、embedding 生成逻辑抽离到 `utils/precompute.py`
-- 将 `scripts/1_precompute.py` 收敛为预计算 CLI 编排入口
-- 将 `PrecomputedEmbeddings` 从 `DTransformer/embedding_loader.py` 中拆出到 `DTransformer/precomputed.py`
-- `DTransformer/embedding_loader.py` 只保留预计算语义融合层实现
-- 将原先集中在 `DTransformer/model.py` 中的组件进一步分离到：
-  - `DTransformer/layers.py`
-  - `DTransformer/grounding.py`
-  - `DTransformer/graph.py`
-  - `DTransformer/precomputed.py`
-- `DTransformer/model.py` 保留主模型、主损失链路和关键前向逻辑
-- 上述重构不改变模型数学定义、主干设计、损失目标和训练方法
-
-#### 文档同步
-
-- `README.md` 更新为当前模块边界
-- `scripts/README.md` 同步脚本侧结构重构
-- `docs/CONFIG.md` 回收重复历史说明，只保留当前配置背景
-- `docs/PRECOMPUTED_EMBEDDINGS_GUIDE.md` 同步预计算模块边界
-
-#### 验证与清理
-
-- 验证通过：
-  - `python scripts/1_precompute.py --help`
-  - `python scripts/2_train.py --help`
-  - `python DTransformer/preprocess_data.py --help`
-  - 相关模块导入 smoke test
-  - 相关文件 `py_compile`
-- 清理完成：
-  - `__pycache__`
-  - `/tmp/*.pyc`
-  - 临时兼容软链接
-
-#### 影响范围
-
-- 不改变已有 `TriSG-KT` 方法定义、配置语义和训练目标
-- 主要影响代码组织方式、运行入口职责划分和文档检索路径
-- 为后续继续接入 benchmark 数据集、做消融和论文整理提供更稳定的工程底座
 
 ### v4.2
 
@@ -341,11 +294,34 @@ gnn:
 - 支持在 `xes` 训练进行时并行为 `algebra05` 等数据集准备 embedding
 - 避免不同数据集共享旧全局 embedding 文件而相互污染
 
+#### v4.2 持续修订：工程化解耦与运行组织收敛
+
+- 将训练/验证循环、AMP、最佳模型保存、指标历史落盘和训练总结持久化统一沉到 `utils/training.py`
+- 将 `scripts/2_train.py` 收敛为训练编排入口，保留模式解析、配置加载、数据准备、模型构建和调度职责
+- 将 KT 序列兼容解析、训练内验证集切分整理到 `utils/kt_dataset.py`
+- 将文本工件、先决图工件、预计算 embedding 工件加载与校验整理到 `utils/embedding_artifacts.py`
+- 将预计算模型解析、文本工件读取、KC 文本回填和 embedding 生成整理到 `utils/precompute.py`
+- 新运行默认写入 `output/runs/{dataset}/{mode}/{date}/{time_tag}/`，并按 `artifacts/metrics/meta` 分层保存
+- 新增 `meta/run_info.json` 记录运行状态、开始时间、Git 提交、数据集与模式，便于区分 `running/completed/failed/interrupted`
+
+#### v4.2 持续修订：对比基线整理
+
+- 删除语义不清的 `baseline` 模式，改为显式的 `dtransformer` 模式
+- `dtransformer` 现在指向官方 `yxonic/DTransformer` 基线实现
+- `sakt / akt / dkt / dkvmn` 改为通过已安装的 `pykt` 官方实现统一接入当前训练管线
+- 训练与验证侧增加 `_eval_shift` 兼容，适配不同基线输出步长
+
+#### v4.2 持续修订：数据与训练链路补丁
+
+- 修复 `algebra05` 等使用 `Subset` 时由 numpy 整型索引触发的 `IndexError`
+- 让 `Lines.__getitem__` 接受 `numbers.Integral`，避免 `np.int64` 索引在 DataLoader 中被错误拒绝
+- 让 `KTDataSubset` 在构造时统一将索引转为 Python `int`
+
 #### 实际效果
 
 - 修复训练过程中由异常历史文件触发的序列长度类错误
 - 重建 XES 的统一题目/KC 编号体系
-- 为后续 benchmark 与论文实验复现提供稳定底座
+- 为后续 benchmark、论文实验复现和多数据集运行提供更稳定的工程底座
 
 ### v4.1
 

@@ -75,16 +75,19 @@ presets:
     gnn:
       use_gnn: false
 
-  # 基线模型（无增强）
-  baseline:
+  # 官方 DTransformer 基线（yxonic/DTransformer）
+  dtransformer:
     training:
       batch_size: 8
       gradient_accumulation_steps: 4
       n_epochs: 100
+      early_stop: 5
     llm:
       use_llm: false
     gnn:
       use_gnn: false
+    model:
+      _baseline: dtransformer
 
   # 完整模型（LLM + GNN）
   full:

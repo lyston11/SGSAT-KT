@@ -32,10 +32,12 @@ from utils.training import (
     create_output_dir,
     initialize_runtime,
     load_best_model_if_available,
+    resolve_output_paths,
     save_best_model,
     save_metrics_history,
     save_training_summary,
     train_epoch,
+    update_run_status,
     validate,
 )
 
@@ -45,7 +47,7 @@ from DTransformer.model import DTransformer
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="TriSG-KT 训练脚本")
-    parser.add_argument('mode', choices=['test', 'baseline', 'full', 'prod', 'sakt', 'akt', 'dkt', 'dkvmn'], help='训练模式')
+    parser.add_argument('mode', choices=['test', 'dtransformer', 'full', 'prod', 'sakt', 'akt', 'dkt', 'dkvmn'], help='训练模式')
     parser.add_argument('--device', help='覆盖设备设置')
     parser.add_argument('--dataset', help='覆盖数据集设置')
     args = parser.parse_args()
@@ -261,18 +263,20 @@ def main():
     print("\n🤖 创建模型...")
     baseline_name = config.get('model__baseline', None)
     if baseline_name:
-        from baselines import create_baseline_model, BaselineWrapper
-        raw_model = create_baseline_model(
+        from baselines import create_baseline_model
+        model = create_baseline_model(
             baseline_name,
             dataset_config["n_questions"],
+            n_pid=dataset_config.get("n_pid", 0),
             d_model=config.get('model_d_model', config.get('d_model', 256)),
             n_heads=config.get('model_n_heads', config.get('n_heads', 8)),
+            n_layers=config.get('model_n_layers', config.get('n_layers', 2)),
             dropout=config.get('model_dropout', config.get('dropout', 0.2)),
             batch_size=config.get('batch_size', config.get('training_batch_size', 16)),
+            seq_len=seq_len,
             device='cpu',
         )
-        model = BaselineWrapper(raw_model)
-        print(f"✅ 基线模型创建完成: {baseline_name}")
+        print(f"✅ pykt 基线模型创建完成: {baseline_name}")
     else:
         # 确保 n_kc 配置正确
         final_n_kc = config.get('gnn_n_kc', config.get('n_kc', 100))
@@ -329,7 +333,7 @@ def main():
 
     print("📌 分支诊断:")
     if not llm_enabled:
-        print("  LLM分支未启用：当前配置 use_llm=False（test/baseline 预设默认关闭）")
+        print("  LLM分支未启用：当前配置 use_llm=False（test/基线 预设默认关闭）")
     else:
         if not precomputed_active and not online_text_active:
             print("  LLM分支退化为ID：预计算未加载且在线文本未就绪")
@@ -339,7 +343,7 @@ def main():
             print("  LLM分支生效：使用在线文本编码")
 
     if not gnn_enabled:
-        print("  GNN分支未启用：当前配置 use_gnn=False（test/baseline 预设默认关闭）")
+        print("  GNN分支未启用：当前配置 use_gnn=False（test/基线 预设默认关闭）")
     elif edge_index is None:
         print("  GNN分支未生效：未找到 edge_index 文件")
     else:
@@ -361,7 +365,13 @@ def main():
     )
 
     # 创建输出目录
-    output_dir = create_output_dir(project_root, args.mode, dataset_name, config, split_info)
+    output_dir, output_paths = create_output_dir(
+        project_root,
+        args.mode,
+        dataset_name,
+        config,
+        split_info,
+    )
 
     # 训练循环
     epochs = config.get('epochs', config.get('n_epochs', 30))
@@ -369,100 +379,136 @@ def main():
     best = {"auc": 0}
     best_epoch = 0
     history = []
-    history_path = os.path.join(output_dir, "metrics_history.json") if output_dir else None
-    summary_path = os.path.join(output_dir, "summary.json") if output_dir else None
+    output_paths = output_paths or (resolve_output_paths(output_dir) if output_dir else None)
+    history_path = output_paths["metrics_history"] if output_paths else None
+    summary_path = output_paths["summary"] if output_paths else None
     test_results = None
+    try:
+        for epoch in range(1, epochs + 1):
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch}/{epochs}")
+            print(f"{'='*60}")
 
-    for epoch in range(1, epochs + 1):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch}/{epochs}")
-        print(f"{'='*60}")
+            # 训练
+            avg_loss = train_epoch(
+                model,
+                train_data,
+                optimizer,
+                config,
+                q_texts,
+                tokenizer,
+                q_to_kc_mapping,
+                edge_index,
+                scaler,
+                use_amp,
+            )
+            print(f"训练损失: {avg_loss:.4f}")
 
-        # 训练
-        avg_loss = train_epoch(
-            model,
-            train_data,
-            optimizer,
-            config,
-            q_texts,
-            tokenizer,
-            q_to_kc_mapping,
-            edge_index,
-            scaler,
-            use_amp,
-        )
-        print(f"训练损失: {avg_loss:.4f}")
+            # 验证
+            print("验证中...")
+            results = validate(
+                model,
+                valid_data,
+                config,
+                q_texts,
+                tokenizer,
+                q_to_kc_mapping,
+                edge_index,
+                use_amp,
+            )
+            print(f"验证结果: {results}")
 
-        # 验证
-        print("验证中...")
-        results = validate(
-            model,
-            valid_data,
-            config,
-            q_texts,
-            tokenizer,
-            q_to_kc_mapping,
-            edge_index,
-            use_amp,
-        )
-        print(f"验证结果: {results}")
+            epoch_record = {
+                "epoch": epoch,
+                "train_loss": avg_loss,
+                "lr": optimizer.param_groups[0]['lr'],
+                **results,
+            }
+            history.append(epoch_record)
+            save_metrics_history(history_path, history)
 
-        epoch_record = {
-            "epoch": epoch,
-            "train_loss": avg_loss,
-            "lr": optimizer.param_groups[0]['lr'],
-            **results,
-        }
-        history.append(epoch_record)
-        save_metrics_history(history_path, history)
+            # 保存最佳模型
+            if results["auc"] > best["auc"]:
+                best = results
+                best_epoch = epoch
+                save_best_model(model, output_dir)
 
-        # 保存最佳模型
-        if results["auc"] > best["auc"]:
-            best = results
-            best_epoch = epoch
-            save_best_model(model, output_dir)
+            update_run_status(
+                output_paths,
+                "running",
+                current_epoch=epoch,
+                best_epoch=best_epoch,
+                best_valid=best,
+                device=config.get("training_device", config.get("device")),
+            )
 
-        # 早停
-        early_stop = config.get('training_early_stop', config.get('early_stop', 0))
-        if early_stop > 0 and epoch - best_epoch >= early_stop:
-            print(f"⏸️  早停触发 (Best: Epoch {best_epoch})")
-            break
+            # 早停
+            early_stop = config.get('training_early_stop', config.get('early_stop', 0))
+            if early_stop > 0 and epoch - best_epoch >= early_stop:
+                print(f"⏸️  早停触发 (Best: Epoch {best_epoch})")
+                break
 
-        # Cosine Annealing: 更新学习率
-        scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"📐 学习率: {current_lr:.6f}")
-
-    print(f"\n{'='*60}")
-    print(f"🎉 训练完成!")
-    print(f"{'='*60}")
-    print(f"最佳验证结果 (Epoch {best_epoch}):")
-    for k, v in best.items():
-        print(f"  {k}: {v:.4f}")
-
-    # 最终测试评估（仅在训练结束后跑一次，不影响模型选择）
-    if test_data is not None:
-        # 加载 best model
-        load_best_model_if_available(model, output_dir, device)
+            # Cosine Annealing: 更新学习率
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"📐 学习率: {current_lr:.6f}")
 
         print(f"\n{'='*60}")
-        print(f"📊 独立测试集评估 (test.txt)")
+        print(f"🎉 训练完成!")
         print(f"{'='*60}")
-        test_results = validate(
-            model,
-            test_data,
-            config,
-            q_texts,
-            tokenizer,
-            q_to_kc_mapping,
-            edge_index,
-            use_amp,
-        )
-        print(f"测试结果:")
-        for k, v in test_results.items():
+        print(f"最佳验证结果 (Epoch {best_epoch}):")
+        for k, v in best.items():
             print(f"  {k}: {v:.4f}")
 
-    save_training_summary(summary_path, best_epoch, best, test_results, split_info)
+        # 最终测试评估（仅在训练结束后跑一次，不影响模型选择）
+        if test_data is not None:
+            # 加载 best model
+            load_best_model_if_available(model, output_dir, device)
+
+            print(f"\n{'='*60}")
+            print(f"📊 独立测试集评估 (test.txt)")
+            print(f"{'='*60}")
+            test_results = validate(
+                model,
+                test_data,
+                config,
+                q_texts,
+                tokenizer,
+                q_to_kc_mapping,
+                edge_index,
+                use_amp,
+            )
+            print(f"测试结果:")
+            for k, v in test_results.items():
+                print(f"  {k}: {v:.4f}")
+
+        save_training_summary(summary_path, best_epoch, best, test_results, split_info)
+        update_run_status(
+            output_paths,
+            "completed",
+            best_epoch=best_epoch,
+            best_valid=best,
+            test=test_results,
+            device=config.get("training_device", config.get("device")),
+        )
+    except KeyboardInterrupt:
+        update_run_status(
+            output_paths,
+            "interrupted",
+            error_type="KeyboardInterrupt",
+            error_message="Training interrupted by user",
+            device=config.get("training_device", config.get("device")),
+        )
+        raise
+    except Exception as exc:
+        update_run_status(
+            output_paths,
+            "failed",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            device=config.get("training_device", config.get("device")),
+        )
+        raise
 
 
 if __name__ == "__main__":
