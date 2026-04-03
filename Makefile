@@ -2,7 +2,7 @@
 
 # Default target
 help:
-	@echo "SGSAT-KT Makefile Commands:"
+	@echo "TriSG-KT Makefile Commands:"
 	@echo "  make install     - Install dependencies"
 	@echo "  make train       - Run training with default settings"
 	@echo "  make test        - Run unit tests (pytest)"
@@ -24,7 +24,7 @@ train:
 
 # Full training with all innovations
 train-full:
-	@echo "Starting full SGSAT-KT training..."
+	@echo "Starting full TriSG-KT training..."
 	./scripts/2_train.sh full
 
 # Unit tests

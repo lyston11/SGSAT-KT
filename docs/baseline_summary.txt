@@ -34,16 +34,15 @@ Expected Configuration:
   - batch_size=2 (smaller due to BERT memory)
   - llm_weight=0.3 (30% LLM, 70% ID embedding)
   - use_llm=True
-  - pretrained_model=/home1/LT/SGSAT-KT/pretrained_models/bert-base-chinese
+  - pretrained_model=<repo_root>/pretrained_models/bert-base-chinese
   - freeze_bert=True (to reduce memory and training time)
 
 Command to Run:
-  cd /home1/LT/SGSAT-KT
+  cd <repo_root>
   /home1/miniconda3/envs/LT_xktN/bin/python3 scripts/train_llm.py \
     -d xes -n 10 -bs 2 -tbs 2 \
     --use_llm --llm_weight 0.3 \
-    --pretrained_model /home1/LT/SGSAT-KT/pretrained_models/bert-base-chinese \
+    --pretrained_model <repo_root>/pretrained_models/bert-base-chinese \
     -o output/xes_llm \
     --device cuda:1 \
     2>&1 | tee train_xes_llm.log
-

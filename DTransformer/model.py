@@ -1,353 +1,27 @@
-"""SGSAT-KT: Semantic Graph Sparse Attention Knowledge Tracing
-基于汪盈2025 SATKT-MFCER框架，进行3处修改:
-- 修改点1: LLM语义Grounding (embedding层) - 新增LLMGrounding模块
-- 修改点2: GNN Prerequisite Graph (输入特征) - 新增GNN模块
-- 修改点3: Graph-Enhanced DCF-Sim (相似度计算) - 新增graph_path_sim
-
-继承关系:
-- 2022年诸葛斌等（SKT-MIER）：继承多指标评估框架
-- 2024年诸葛斌等（SKT-MFER / KTM-LC）：继承遗忘LSTM与难度学习
-- 2025年汪盈硕士论文（SATKT-MFCER）：完整复用核心组件
-
-具体修改点（代码改动量<25%）:
-- 修改点1: q_emb = self.q_embed(q_id) -> q_text_emb + proj(kc_emb)
-- 修改点2: input_emb = q_emb + time_emb -> input_emb = q_emb + prereq_emb + time_emb
-- 修改点3: sim = 0.5*cos + 0.3*diff + 0.2*anomaly -> + 0.1*graph_path_sim
-"""
+"""TriSG-KT: Triple-Sparse Semantic Graph Knowledge Tracing."""
 import math
 import random
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from DTransformer.embedding_loader import LLMGroundingWithPrecomputed
+from DTransformer.graph import DCFSimGraphEnhanced, GNNPrerequisiteGraph
+from DTransformer.grounding import LLMGrounding, LLMGroundingWithID
+from DTransformer.layers import DTransformerLayer, MultiHeadAttention, attention
 
 MIN_SEQ_LEN = 5
 
 
-# ============ 修改点1: LLM语义Grounding模块 ============
-class LLMGrounding(nn.Module):
-    """
-    LLM语义Grounding模块（v2: 多层投影）
-    将题目文本和知识点文本通过 BERT + 多层投影转换为语义嵌入
-    """
-    def __init__(
-        self,
-        d_model=128,
-        llm_proj_dim=256,
-        llm_inter_dim=512,
-        pretrained_model="pretrained_models/qwen3-4b",
-        freeze_bert=True
-    ):
-        super().__init__()
-        self.d_model = d_model
-
-        try:
-            from transformers import AutoModel
-            self.bert = AutoModel.from_pretrained(pretrained_model)
-            self.bert_hidden_size = self.bert.config.hidden_size
-
-            if freeze_bert:
-                for param in self.bert.parameters():
-                    param.requires_grad = False
-        except ImportError:
-            print("Warning: transformers not installed, LLM grounding disabled")
-            self.bert = None
-            self.bert_hidden_size = llm_proj_dim
-
-        # 多层漏斗式投影
-        self.proj_q = nn.Sequential(
-            nn.Linear(self.bert_hidden_size, llm_inter_dim),
-            nn.GELU(),
-            nn.LayerNorm(llm_inter_dim),
-            nn.Dropout(0.1),
-            nn.Linear(llm_inter_dim, llm_proj_dim),
-            nn.LayerNorm(llm_proj_dim),
-        )
-        self.proj_kc = nn.Sequential(
-            nn.Linear(self.bert_hidden_size, llm_inter_dim),
-            nn.GELU(),
-            nn.LayerNorm(llm_inter_dim),
-            nn.Dropout(0.1),
-            nn.Linear(llm_inter_dim, llm_proj_dim),
-            nn.LayerNorm(llm_proj_dim),
-        )
-        self.W_p = nn.Linear(llm_proj_dim, llm_proj_dim, bias=False)
-        
-    def forward(self, q_text_input, kc_text_input=None):
-        """
-        Args:
-            q_text_input: 题目文本的BERT输入 (dict with input_ids, attention_mask)
-            kc_text_input: 知识点文本的BERT输入
-        Returns:
-            e_q: 题目语义嵌入 (batch, d_model)
-        """
-        if self.bert is None:
-            return torch.zeros(q_text_input['input_ids'].size(0), self.d_model, device=self.proj_q.weight.device)
-        
-        q_outputs = self.bert(**q_text_input)
-        q_cls = q_outputs.last_hidden_state[:, 0, :]
-        e_q = self.proj_q(q_cls)
-        
-        if kc_text_input is not None:
-            kc_outputs = self.bert(**kc_text_input)
-            kc_cls = kc_outputs.last_hidden_state[:, 0, :]
-            e_kc = self.proj_kc(kc_cls)
-            e_q = e_q + self.W_p(e_kc)
-        
-        return e_q
-    
-    def get_contrastive_loss(self, e_q, e_pos, e_neg, temperature=0.07):
-        """对比损失: L_con = -log(exp(sim(e_i,e_j+)/τ) / Σexp(sim(e_i,e_k)/τ))"""
-        e_q = F.normalize(e_q, p=2, dim=-1)
-        e_pos = F.normalize(e_pos, p=2, dim=-1)
-        e_neg = F.normalize(e_neg, p=2, dim=-1)
-        
-        pos_sim = torch.sum(e_q * e_pos, dim=-1) / temperature
-        neg_sim = torch.bmm(e_neg, e_q.unsqueeze(-1)).squeeze(-1) / temperature
-        
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
-        labels = torch.zeros(e_q.size(0), dtype=torch.long, device=e_q.device)
-        
-        return F.cross_entropy(logits, labels)
-
-
-class LLMGroundingWithID(nn.Module):
-    """
-    结合ID嵌入和LLM语义嵌入的混合嵌入模块（v3: 门控融合）
-    ID embedding 固定为 id_dim，LLM 投影到 llm_proj_dim，
-    通过门控机制融合，投影到 d_model。
-    """
-    def __init__(
-        self,
-        n_questions,
-        d_model=256,
-        id_dim=128,
-        llm_proj_dim=256,
-        llm_inter_dim=512,
-        pretrained_model="pretrained_models/qwen3-4b",
-        freeze_bert=True,
-        use_llm=True,
-        id_dropout_rate=0.15,
-    ):
-        super().__init__()
-        self.use_llm = use_llm
-        self.d_model = d_model
-        self.id_dim = id_dim
-        self.llm_proj_dim = llm_proj_dim
-
-        # ID 嵌入（固定 id_dim 维）
-        self.q_embed = nn.Embedding(n_questions + 1, id_dim)
-
-        # LLM 语义嵌入（多层投影到 llm_proj_dim）
-        if use_llm:
-            self.llm = LLMGrounding(
-                d_model, llm_proj_dim=llm_proj_dim,
-                llm_inter_dim=llm_inter_dim,
-                pretrained_model=pretrained_model, freeze_bert=freeze_bert,
-            )
-            # v3: 门控融合
-            self.id_to_llm_proj = nn.Linear(id_dim, llm_proj_dim)
-            self.gate_linear = nn.Linear(llm_proj_dim, llm_proj_dim)
-            self.id_dropout = nn.Dropout(p=id_dropout_rate)
-            self.fusion_norm = nn.LayerNorm(llm_proj_dim)
-        else:
-            self.id_proj = nn.Linear(id_dim, d_model)
-
-    def forward(self, q_ids, q_text_input=None, kc_text_input=None):
-        """
-        Args:
-            q_ids: 题目ID (batch, seq_len)
-            q_text_input: 题目文本BERT输入
-            kc_text_input: 知识点文本BERT输入
-        Returns:
-            q_emb: 混合嵌入 (batch, seq_len, d_model)
-        """
-        id_emb = self.q_embed(q_ids)  # (batch, seq_len, id_dim)
-
-        if not self.use_llm or q_text_input is None:
-            return self.id_proj(id_emb)
-
-        # v3: ID Dropout（仅训练时）
-        if self.training:
-            id_emb = self.id_dropout(id_emb)
-
-        llm_emb = self.llm(q_text_input, kc_text_input)  # (batch*seq_len, llm_proj_dim)
-
-        batch_size, seq_len, _ = id_emb.size()
-        llm_emb = llm_emb.view(batch_size, seq_len, self.llm_proj_dim)
-
-        # v3: 门控融合
-        id_proj = self.id_to_llm_proj(id_emb)               # [B, L, llm_proj_dim]
-        gate_val = torch.sigmoid(self.gate_linear(llm_emb))  # [B, L, llm_proj_dim]
-        gated_llm = gate_val * llm_emb                       # [B, L, llm_proj_dim]
-        combined = self.fusion_norm(gated_llm + id_proj)     # [B, L, llm_proj_dim] = d_model
-        return combined
-
-
-# ============ 修改点2: GNN Prerequisite Graph模块 ============
-class SimpleGCNLayer(nn.Module):
-    """简单GCN层（不依赖torch_geometric）"""
-    def __init__(self, d_model):
-        super().__init__()
-        self.linear = nn.Linear(d_model, d_model)
-
-    def forward(self, x, edge_index):
-        if edge_index is None or edge_index.shape[1] == 0:
-            return self.linear(x)
-        n_nodes = x.size(0)
-
-        # 边界检查：过滤掉超出范围的索引（使用 clamp 避免 CUDA 错误）
-        edge_index = edge_index.clamp(0, n_nodes - 1)
-
-        adj = torch.zeros(n_nodes, n_nodes, device=x.device, dtype=x.dtype)
-        adj[edge_index[0], edge_index[1]] = 1.0
-        degree = adj.sum(dim=1, keepdim=True).clamp(min=1)
-        norm_adj = adj / degree
-        x = torch.matmul(norm_adj, x)
-        return self.linear(x)
-
-
-class GNNPrerequisiteGraph(nn.Module):
-    """GNN先决图模块（创新点2）
-    
-    公式: h_v^(l+1) = σ(Σ_{u∈N(v)} (1/√(d_v*d_u)) * W^(l) * h_u^(l))
-    """
-    def __init__(self, n_kc, d_model=128, n_layers=2, dropout=0.1):
-        super().__init__()
-        self.n_kc = n_kc
-        self.kc_embed = nn.Embedding(n_kc, d_model)
-        self.gcn_layers = nn.ModuleList([
-            SimpleGCNLayer(d_model) for _ in range(n_layers)
-        ])
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
-        
-    def forward(self, edge_index, kc_ids=None):
-        x = self.kc_embed.weight
-        if edge_index is not None:
-            # 避免修改原始edge_index，创建副本
-            if edge_index.device != x.device:
-                edge_index = edge_index.clone().to(x.device)
-            # 安全检查：过滤超出范围的索引
-            n_nodes = x.size(0)
-            edge_index = edge_index.clamp(0, n_nodes - 1)
-        for gcn in self.gcn_layers:
-            x_new = gcn(x, edge_index)
-            x_new = F.relu(x_new)
-            x_new = self.dropout(x_new)
-            x = self.layer_norm(x + x_new)
-        if kc_ids is None:
-            return x
-        kc_ids = kc_ids.clamp(0, self.n_kc - 1)
-        return x[kc_ids]
-
-
-# ============ 修改点3: 图增强DCF-Sim相似度 ============
-class DCFSimGraphEnhanced:
-    """动态认知融合相似度（图增强版）— 后处理工具类
-
-    用于训练后的用户相似度分析和推荐，不参与模型训练循环。
-    公式: sim(u,v) = 0.5*cos + 0.25*diff_sim + 0.15*anomaly + 0.1*graph_path_sim
-    """
-    def __init__(self, n_users, n_questions, half_life=20):
-        self.n_users = n_users
-        self.n_questions = n_questions
-        self.half_life = half_life
-        self.user_records = {}
-        self.question_difficulty = {}
-        self.similarity_matrix = None
-        
-    def add_interaction(self, user_id, question_id, correct, difficulty=None):
-        if user_id not in self.user_records:
-            self.user_records[user_id] = []
-        self.user_records[user_id].append({
-            'question_id': question_id,
-            'correct': correct,
-            'difficulty': difficulty if difficulty is not None else 0.5
-        })
-        if difficulty is not None:
-            self.question_difficulty[question_id] = difficulty
-        self.similarity_matrix = None
-    
-    def compute_similarity(self, user_u, user_v, kc_mapping=None):
-        """
-        计算综合相似度（按文档修改点3要求）
-
-        原DCF-Sim: sim = 0.5*cos(S_u, S_v) + 0.3*diff_sim + 0.2*anomaly
-        修改后（文档要求）: sim = 0.5*cos + 0.25*diff_sim + 0.15*anomaly + 0.1*graph_path_sim
-        """
-        if user_u not in self.user_records or user_v not in self.user_records:
-            return 0.5
-
-        q_u = set(r['question_id'] for r in self.user_records[user_u])
-        q_v = set(r['question_id'] for r in self.user_records[user_v])
-        common = q_u & q_v
-        if not common:
-            return 0.0
-
-        # 1. cos相似度: 基于共同答题的比例
-        cos_sim = len(common) / max(len(q_u | q_v), 1)
-
-        # 2. diff_sim: 难度差异相似度（文档要求的0.25权重）
-        diff_sim = 0.0
-        if q_u and q_v:
-            diff_u = [self.question_difficulty.get(q, 0.5) for q in q_u]
-            diff_v = [self.question_difficulty.get(q, 0.5) for q in q_v]
-            avg_diff_u = sum(diff_u) / len(diff_u)
-            avg_diff_v = sum(diff_v) / len(diff_v)
-            diff_sim = 1.0 - abs(avg_diff_u - avg_diff_v)  # 难度越接近，相似度越高
-
-        # 3. anomaly: 异常检测相似度（文档要求的0.15权重）
-        anomaly = 0.5  # 默认值，可以根据实际异常检测算法计算
-
-        # 4. graph_path_sim: 图路径相似度（新增，文档要求的0.1权重）
-        graph_sim = 0.5
-        if kc_mapping:
-            kc_u = set()
-            kc_v = set()
-            for q in q_u:
-                if q in kc_mapping:
-                    kc_u.update(kc_mapping[q])
-            for q in q_v:
-                if q in kc_mapping:
-                    kc_v.update(kc_mapping[q])
-            if kc_u and kc_v:
-                graph_sim = len(kc_u & kc_v) / len(kc_u | kc_v)
-
-        # 按文档公式(修改点3): sim = 0.5*cos + 0.25*diff + 0.15*anomaly + 0.1*graph_path_sim
-        final_sim = (
-            0.5 * cos_sim +
-            0.25 * diff_sim +
-            0.15 * anomaly +
-            0.1 * graph_sim
-        )
-
-        return final_sim
-    
-    def get_k_nearest_neighbors(self, user_id, k, kc_mapping=None):
-        """获取K个最近邻用户"""
-        sims = []
-        for v in range(self.n_users):
-            if v != user_id:
-                sim = self.compute_similarity(user_id, v, kc_mapping)
-                sims.append((v, sim))
-        sims.sort(key=lambda x: -x[1])
-        return sims[:k]
-
-
 class DTransformer(nn.Module):
     """
-    SGSAT-KT主模型（基于汪盈2025 SATKT-MFCER框架）
+    TriSG-KT 主模型
     
-    三大创新点整合:
-    - 修改点1: LLM语义Grounding (embedding层)
-    - 修改点2: GNN Prerequisite Graph (输入特征)
-    - 修改点3: Graph-Enhanced DCF-Sim (后处理相似度分析工具)
-    
-    继承汪盈2025硕士论文SATKT主干结构，代码改动量<25%
+    三类关键增强:
+    - 语义增强: LLM 语义 grounding 与 SSA 对齐
+    - 结构增强: GNN prerequisite graph
+    - 优化/分析增强: graph-enhanced similarity 与对比学习
     """
     def __init__(
         self,
@@ -422,7 +96,7 @@ class DTransformer(nn.Module):
                     id_dropout_rate=id_dropout_rate,
                 )
         else:
-            # 原SATKT嵌入层（向后兼容）
+            # 纯 ID 嵌入层（向后兼容）
             self.q_embed = nn.Embedding(n_questions + 1, d_model)
         
         self.s_embed = nn.Embedding(2, d_model)
@@ -564,15 +238,15 @@ class DTransformer(nn.Module):
     def embedding(self, q, s, pid=None, kc_ids=None, edge_index=None, 
                   q_text_input=None, kc_text_input=None):
         """
-        增强的embedding函数（整合修改点1和修改点2）
+        增强的 embedding 函数（整合语义增强与图结构增强）
         
-        修改点1: LLM语义Grounding
-            原SATKT: q_emb = self.q_embed(q_id)  # 仅ID embedding
-            修改后: q_text_emb + proj(kc_emb)    # LLM语义 + 知识点融合
+        语义增强:
+            基础形式: q_emb = self.q_embed(q_id)      # 仅 ID embedding
+            当前形式: q_text_emb + proj(kc_emb)       # 语义 + 知识点融合
         
-        修改点2: GNN先决图嵌入
-            原输入: input_emb = q_emb + time_emb
-            修改后: input_emb = q_emb + prereq_emb + time_emb
+        图结构增强:
+            基础输入: input_emb = q_emb + time_emb
+            当前输入: input_emb = q_emb + prereq_emb + time_emb
         """
         lens = (s >= 0).sum(dim=1)
         q = q.masked_fill(q < 0, 0)
@@ -591,7 +265,7 @@ class DTransformer(nn.Module):
             id_emb = self.q_embed.q_embed(q)  # [B, L, 128]
             q_emb = self.q_embed.id_to_llm_proj(id_emb)  # [B, L, 256]
         else:
-            # 原SATKT嵌入
+            # 纯 ID 嵌入
             q_emb = self.q_embed(q)
 
         # ============ 修改点2: 加入GNN先决图嵌入 ============
@@ -871,151 +545,3 @@ class DTransformer(nn.Module):
             y = torch.sigmoid(y)
 
         return y
-
-
-class DTransformerLayer(nn.Module):
-    def __init__(self, d_model, n_heads, dropout, kq_same=True):
-        super().__init__()
-        self.masked_attn_head = MultiHeadAttention(d_model, n_heads, kq_same)
-
-        self.dropout_rate = dropout
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(d_model)
-
-    def device(self):
-        return next(self.parameters()).device
-
-    def forward(self, query, key, values, lens, peek_cur=False, need_scores=False):
-        seqlen = query.size(1)
-        mask = torch.ones(seqlen, seqlen).tril(0 if peek_cur else -1)
-        mask = mask.bool()[None, None, :, :].to(self.device())
-
-        if self.training:
-            mask = mask.expand(query.size(0), -1, -1, -1).contiguous()
-
-            for b in range(query.size(0)):
-                if lens[b] < MIN_SEQ_LEN:
-                    continue
-                idx = random.sample(
-                    range(lens[b] - 1), max(1, int(lens[b] * self.dropout_rate))
-                )
-                for i in idx:
-                    mask[b, :, i + 1 :, i] = 0
-
-        query_, scores = self.masked_attn_head(
-            query, key, values, mask, maxout=not peek_cur, need_scores=need_scores
-        )
-        query = query + self.dropout(query_)
-        return self.layer_norm(query), scores
-
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_heads, kq_same=True, bias=True, dropout=0.2):
-        super().__init__()
-        self.d_model = d_model
-        self.d_k = d_model // n_heads
-        self.h = n_heads
-        self.dropout = dropout
-        self.q_linear = nn.Linear(d_model, d_model, bias=bias)
-        if kq_same:
-            self.k_linear = self.q_linear
-        else:
-            self.k_linear = nn.Linear(d_model, d_model, bias=bias)
-        self.v_linear = nn.Linear(d_model, d_model, bias=bias)
-
-        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.gammas = nn.Parameter(torch.zeros(n_heads, 1, 1))
-        torch.nn.init.xavier_uniform_(self.gammas)
-
-    def k_select(self, scores, k_index):
-        bs, head, seqlen, _ = scores.size()
-        if k_index >= seqlen:
-            return F.softmax(scores, dim=-1)
-
-        scores_a = scores[:, :, :k_index, :]
-        scores_b = scores[:, :, k_index:, :].reshape(bs * head * (seqlen - k_index), -1)
-
-        sorted_scores, _ = torch.sort(scores_b, descending=True)
-        scores_t = sorted_scores[:, k_index - 1:k_index].repeat(1, seqlen)
-
-        neg_inf = torch.finfo(scores_b.dtype).min
-        sparse_scores_b = torch.where(scores_b - scores_t >= 0, scores_b, torch.full_like(scores_b, neg_inf))
-        scores_b = sparse_scores_b.reshape(bs, head, seqlen - k_index, -1)
-
-        scores = torch.cat([scores_a, scores_b], dim=2)
-        scores = F.softmax(scores, dim=-1)
-        return scores
-
-    def forward(self, q, k, v, mask, emb_type="qid", sparse_ratio=0.8, k_index=5, maxout=False, need_scores=False):
-        bs = q.size(0)
-
-        q = self.q_linear(q).view(bs, -1, self.h, self.d_k)
-        k = self.k_linear(k).view(bs, -1, self.h, self.d_k)
-        v = self.v_linear(v).view(bs, -1, self.h, self.d_k)
-
-        k = k.transpose(1, 2)
-        q = q.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        v_, scores = attention(
-            q,
-            k,
-            v,
-            mask,
-            self.gammas,
-            maxout,
-            need_scores,
-        )
-
-        if need_scores and scores is not None:
-            scores = self.k_select(scores, k_index)
-        else:
-            scores = None
-
-        concat = v_.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
-
-        output = self.out_proj(concat)
-
-        return output, scores
-
-
-def attention(q, k, v, mask, gamma=None, maxout=False, need_scores=False):
-    d_k = k.size(-1)
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
-    bs, head, seqlen, _ = scores.size()
-
-    if gamma is not None:
-        x1 = torch.arange(seqlen).float().expand(seqlen, -1).to(gamma.device)
-        x2 = x1.transpose(0, 1).contiguous()
-
-        with torch.no_grad():
-            neg_inf = torch.finfo(scores.dtype).min
-            scores_ = scores.masked_fill(mask == 0, neg_inf)
-            scores_ = F.softmax(scores_, dim=-1)
-
-            distcum_scores = torch.cumsum(scores_, dim=-1)
-            disttotal_scores = torch.sum(scores_, dim=-1, keepdim=True)
-            position_effect = torch.abs(x1 - x2)[None, None, :, :]
-            dist_scores = torch.clamp(
-                (disttotal_scores - distcum_scores) * position_effect, min=0.0
-            )
-            dist_scores = dist_scores.sqrt().detach()
-
-        gamma = -1.0 * gamma.abs().unsqueeze(0)
-        total_effect = torch.clamp((dist_scores * gamma).exp(), min=1e-5, max=1e5)
-
-        scores *= total_effect
-
-    neg_inf = torch.finfo(scores.dtype).min
-    scores.masked_fill_(mask == 0, neg_inf)
-    scores = F.softmax(scores, dim=-1)
-    scores = scores.masked_fill(mask == 0, 0)
-
-    if maxout:
-        scale = torch.clamp(1.0 / scores.max(dim=-1, keepdim=True)[0], max=5.0)
-        scores *= scale
-
-    output = torch.matmul(scores, v)
-    if need_scores:
-        return output, scores
-    return output, None

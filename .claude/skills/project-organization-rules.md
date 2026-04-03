@@ -27,8 +27,11 @@ project_root/
 - `requirements.txt` - Python依赖
 - `pyproject.toml` - Poetry配置（如使用）
 - `Makefile` - 快捷命令（如使用）
-- `CHANGELOG.md` - 变更日志
 - `run_*.sh` - 主启动脚本（最多1-2个）
+
+**版本历史文档约定：**
+- 正式版本记录统一维护在 `docs/TRAINING.md` 的“版本记录”章节
+- 根目录不再单独要求 `CHANGELOG.md`
 
 **❌ 不要在根目录放置：**
 - 临时实验脚本

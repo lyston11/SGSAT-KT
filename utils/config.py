@@ -1,5 +1,5 @@
 """
-Configuration utilities for SGSAT-KT
+Configuration utilities for TriSG-KT
 配置工具
 """
 

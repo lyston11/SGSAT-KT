@@ -1,7 +1,7 @@
 [tool.poetry]
-name = "sgsat-kt"
+name = "trisg-kt"
 version = "0.1.0"
-description = "SGSAT-KT: Semantic Graph Sparse Attention Knowledge Tracing"
+description = "TriSG-KT: Triple-Sparse Semantic Graph Knowledge Tracing"
 authors = ["Yu Yin <yxonic@gmail.com>"]
 
 [tool.poetry.dependencies]

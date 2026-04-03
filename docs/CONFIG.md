@@ -1,10 +1,23 @@
-# SGSAT-KT 配置指南
+# TriSG-KT 配置指南
 
 ## 📝 重要提示
 
 **只需修改一个配置文件：`configs/default.yaml`**
 
 不需要修改任何代码！
+
+## 工程化拆分
+
+当前项目已开始按职责拆分公共能力，避免训练入口脚本和单个模型文件持续膨胀：
+
+- `utils/project.py`：统一项目路径
+- `utils/experiment.py`：统一 `default.yaml` / preset 合并与数据集注册表读取
+- `utils/data_pipeline.py`：统一数据源构建、异常序列兼容解析、预计算 embedding 校验
+- `DTransformer/layers.py`：注意力层与底层 attention
+- `DTransformer/grounding.py`：在线语义 grounding 组件
+- `DTransformer/graph.py`：GNN 先决图和图相似度后处理组件
+
+当前原则是：不改变模型方法和训练语义，只降低代码耦合度。
 
 ---
 
@@ -16,6 +29,7 @@
 ./scripts/train.sh test      # 快速测试（5轮）
 ./scripts/train.sh baseline  # 基线模型
 ./scripts/train.sh full      # 完整模型（LLM+GNN）← 推荐
+./scripts/train.sh full algebra05  # 指定数据集
 ./scripts/train.sh prod      # 生产环境（200轮）
 ```
 
@@ -92,6 +106,7 @@ presets:
 ```bash
 conda activate lyston
 ./scripts/train.sh full   # 自动应用 full 预设的配置
+./scripts/train.sh full algebra05
 ```
 
 ### 自定义参数
@@ -122,7 +137,7 @@ recommendation:
   cl_loss: true              # 是否使用对比损失
 ```
 
-### v3.0 新增参数
+### 当前关键参数
 
 ```yaml
 model:
@@ -134,53 +149,35 @@ llm:
   contrast_temperature: 0.07  # InfoNCE 温度
 ```
 
-### v3.1 基座模型优化
+### 当前配置说明
 
-- `n_know: 32→64`: 知识组件扩容，匹配 xes 数据集 ~812 个知识点
-- Cosine Annealing 学习率调度: 自动配置，无需手动设置
-- 重复次数嵌入: `max_repeats=20`，建模题目重复出现次数（遗忘/强化信号）
-- Embedding dropout: 训练时对 q_emb/s_emb 施加 dropout 正则化
+- `n_know = 64`：当前主干使用 64 个知识组件
+- `id_dropout_rate = 0.15`：训练时随机削弱 ID shortcut，迫使模型利用语义分支
+- `lambda_contra = 0.3`：embedding 级 InfoNCE 约束权重
+- `contrast_temperature = 0.07`：InfoNCE 温度参数
+- `cross_attn_heads = 4`：SSA 选择性语义对齐头数
+- XES 当前配置基于重建后的干净协议：
+  - `n_questions = 7618`
+  - `n_kc = 865`
 
-### v4.2 XES 数据协议修复
+配置项的历史演化、版本修订背景和各版本修复范围，请统一查看 [训练指南](TRAINING.md) 中的“版本记录”章节。
 
-- 修复 `process_xes.py` 的项目根路径计算，重新对齐原始 `xes_math.csv`
-- 重新生成标准三行格式的 `xes/train.txt`、`xes/valid.txt`、`xes/test.txt`
-- `xes_question_texts.json` 中的 `skill` 现为 dense `kc_id`，同时保留 `raw_skill`
-- XES 当前配置更新为 `n_questions=7618`、`n_kc=865`
-- `train.sh` 增加 `q_count` 校验，旧的 `6530/828` embedding 会自动触发重算
+### Benchmark 数据集文本/图准备
 
-### v4.1 项目缺陷修复
+运行 `assist09 / assist17 / statics / doudouyun` 的 `full` 模式前，先执行：
 
-- 训练/评估职责分离: 无 `valid` 时从 `train.txt` 生成验证集，`test.txt` 仅用于最终评估
-- 预计算工件校验增强: 检查 `dataset_name` 元信息和 KC 覆盖，避免静默复用旧 embedding
-- `cl_loss=True` 时训练目标补回 `knowledge_consistency`
-- 梯度累积按实际反向传播步数统计，兼容序列切块场景
-- 输出目录新增 `metrics_history.json`、`summary.json`、`split_info.json`
+```bash
+python DTransformer/preprocess_data.py --dataset assist09
+python DTransformer/preprocess_data.py --dataset assist17
+python DTransformer/preprocess_data.py --dataset statics
+python DTransformer/preprocess_data.py --dataset doudouyun
+```
 
-### v4.0 项目缺陷修复
-
-- `cross_attn_heads` 配置现已正确传递到模型（之前硬编码为 4）
-- `freeze_bert` 配置现已正确传递到模型
-- `n_know` 默认值统一为 64（之前三处不一致: yaml=64, 脚本 fallback=32, 模型 default=16）
-- `n_kc` 默认值按当前 XES 原始 skill id 空间对齐为 855，不再依赖运行时热修复
-- 删除无效配置项: `model.name`, `llm.llm_weight`, `llm.max_seq_length`, `gnn.graph_weight`, `gnn.dropout`, `gpu.primary_gpu`, `gpu.use_data_parallel`, `data.*`, `output.*`, `evaluation.*`
-- 修复 shell 脚本: test/baseline 等非 LLM 模式不再要求 embedding 文件
-- 修复在线 LLM fallback 路径: `prepare_bert_inputs` 在 list 包装前调用
-- 修复 LLM→ID fallback 维度不匹配: 退化为 `id_to_llm_proj(id_emb)` 输出 256 维
-- 修复预计算嵌入检查: `use_precomputed` 检查增加 `use_llm` 守卫，非 LLM 模式不检查
-- 修复预计算嵌入校验: 自动检查 `dataset_name` 元信息和 KC 覆盖，避免静默复用旧数据集工件
-- 修复训练评估链路: 无 `valid` 时从 train 生成验证集，`test.txt` 仅用于最终评估
-- 预计算脚本支持数据集参数: `python scripts/1_precompute.py [dataset]`，默认从 config 读取
-- DCFSimGraphEnhanced 标注为后处理工具类，不参与训练循环
-- pyproject.toml 依赖版本对齐 requirements.txt，修复拼写错误
-- 清理 config_loader.py 死代码 (TrainingConfig 类)
-- Makefile: `make test` → pytest 单测，新增 `make smoke-test` 训练冒烟测试
-
-### v4.0 Cross-Attention 融合（v4.2 延续）
-
-- `cross_attn_heads: 4`: Cross-Attention 头数，ID embedding 作为 Query attend LLM 语义特征
-- 门控残差: 2 层 gate network 输出标量，防止 attention 坍塌
-- Causal Mask: 保持 KT 自回归特性
+- 脚本会根据 `data/datasets.toml` 的 `inputs` 自动解析序列布局
+- 会补齐 `data/text_data/{dataset}_question_texts.json` 和 `data/text_data/{dataset}_kc_texts.json`
+- 会生成 `data/processed/{dataset}_edge_index.npy` 和 `data/processed/{dataset}_kc_ids.npy`
+- `assist17` 会尽量利用原始 skill label；其余缺少文本的数据集会生成最小合成文本占位
+- 因此这些 benchmark 数据集现在也能直接走 `1_precompute.sh {dataset}` 和 `2_train.sh full --dataset {dataset}`
 
 ## 🚀 使用方法
 
@@ -189,6 +186,7 @@ llm:
 ```bash
 # 使用默认配置（full模式）
 ./scripts/train.sh full
+./scripts/train.sh full algebra05
 
 # 使用其他模式
 ./scripts/train.sh test      # 快速测试
@@ -201,9 +199,11 @@ llm:
 ```bash
 # 步骤1: 预计算嵌入（仅第一次需要）
 ./scripts/1_precompute.sh
+./scripts/1_precompute.sh algebra05 --device cpu
 
 # 步骤2: 训练模型
 ./scripts/2_train.sh full
+./scripts/2_train.sh full --dataset algebra05
 ```
 
 ## 📥 下载Qwen模型
@@ -211,7 +211,7 @@ llm:
 ### 选项1: 使用 HuggingFace CLI
 
 ```bash
-cd /home1/LT/SGSAT-KT/pretrained_models/
+cd pretrained_models/
 
 # 安装工具
 pip install huggingface-hub
@@ -228,7 +228,7 @@ huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct --local-dir Qwen2.5-1.5B-Ins
 ```bash
 pip install modelscope
 
-cd /home1/LT/SGSAT-KT/pretrained_models/
+cd pretrained_models/
 
 python -c "
 from modelscope import snapshot_download

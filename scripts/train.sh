@@ -5,11 +5,23 @@
 set -e
 
 MODE=${1:-full}
+CURRENT_DATASET=${2:-}
+
+if [ -z "$CURRENT_DATASET" ]; then
+    CURRENT_DATASET=$(python - <<'PY'
+import yaml
+with open('configs/default.yaml') as f:
+    cfg = yaml.safe_load(f)
+print(cfg.get('training', {}).get('dataset', 'xes'))
+PY
+)
+fi
 
 echo "=========================================="
-echo "🚀 SGSAT-KT 完整训练流程"
+echo "🚀 TriSG-KT 完整训练流程"
 echo "=========================================="
 echo "模式: $MODE"
+echo "数据集: $CURRENT_DATASET"
 echo ""
 
 # 阶段1: 检查预计算嵌入（仅 LLM 相关模式需要）
@@ -21,16 +33,26 @@ if echo " $NO_LLM_MODES " | grep -q " $MODE "; then
 else
     echo "📂 检查预计算嵌入..."
 
-    if [ ! -f "data/embeddings/question_embeddings.pkl" ]; then
+    QUESTION_EMB_PATH="data/embeddings/${CURRENT_DATASET}_question_embeddings.pkl"
+    KC_EMB_PATH="data/embeddings/${CURRENT_DATASET}_kc_embeddings.pkl"
+    if [ ! -f "$QUESTION_EMB_PATH" ] && [ -f "data/embeddings/question_embeddings.pkl" ]; then
+        QUESTION_EMB_PATH="data/embeddings/question_embeddings.pkl"
+    fi
+    if [ ! -f "$KC_EMB_PATH" ] && [ -f "data/embeddings/kc_embeddings.pkl" ]; then
+        KC_EMB_PATH="data/embeddings/kc_embeddings.pkl"
+    fi
+
+    if [ ! -f "$QUESTION_EMB_PATH" ]; then
         echo "❌ 预计算嵌入不存在"
         NEED_PRECOMPUTE=true
-    elif [ ! -f "data/embeddings/kc_embeddings.pkl" ]; then
+    elif [ ! -f "$KC_EMB_PATH" ]; then
         echo "❌ 知识点预计算嵌入不存在"
         NEED_PRECOMPUTE=true
     else
         # 检查嵌入维度、数据集元信息和 KC 覆盖
-        EMBED_INFO=$(python - <<'PY'
+        EMBED_INFO=$(CURRENT_DATASET="$CURRENT_DATASET" QUESTION_EMB_PATH="$QUESTION_EMB_PATH" KC_EMB_PATH="$KC_EMB_PATH" python - <<'PY'
 import json
+import os
 import pickle
 import yaml
 from pathlib import Path
@@ -38,12 +60,12 @@ from pathlib import Path
 with open('configs/default.yaml') as f:
     cfg = yaml.safe_load(f)
 
-dataset = cfg.get('training', {}).get('dataset', 'xes')
+dataset = os.environ.get('CURRENT_DATASET') or cfg.get('training', {}).get('dataset', 'xes')
 model_path = cfg.get('llm', {}).get('pretrained_model', 'pretrained_models/bert-base-chinese')
 
-with open('data/embeddings/question_embeddings.pkl', 'rb') as f:
+with open(os.environ['QUESTION_EMB_PATH'], 'rb') as f:
     q_data = pickle.load(f)
-with open('data/embeddings/kc_embeddings.pkl', 'rb') as f:
+with open(os.environ['KC_EMB_PATH'], 'rb') as f:
     kc_data = pickle.load(f)
 
 required_kc = set()
@@ -116,13 +138,7 @@ else:
         elif [ "$EMBED_Q_DATASET" != "$EMBED_KC_DATASET" ]; then
             echo "⚠️  题目嵌入与知识点嵌入来自不同数据集"
             NEED_PRECOMPUTE=true
-        elif [ "$EMBED_Q_DATASET" != "$(python - <<'PY'
-import yaml
-with open('configs/default.yaml') as f:
-    cfg = yaml.safe_load(f)
-print(cfg.get('training', {}).get('dataset', 'xes'))
-PY
-)" ]; then
+        elif [ "$EMBED_Q_DATASET" != "$CURRENT_DATASET" ]; then
             echo "⚠️  预计算嵌入数据集与当前配置不一致"
             NEED_PRECOMPUTE=true
         elif [ -n "$EXPECTED_Q_COUNT" ] && [ "$EMBED_Q_COUNT" != "$EXPECTED_Q_COUNT" ]; then
@@ -145,7 +161,7 @@ if [ "$NEED_PRECOMPUTE" = true ]; then
     echo "⏱️  预计时间: 15分钟"
     echo ""
 
-    ./scripts/1_precompute.sh
+    ./scripts/1_precompute.sh "$CURRENT_DATASET"
 
     if [ $? -ne 0 ]; then
         echo "❌ 预计算失败"
@@ -161,9 +177,10 @@ echo "=========================================="
 echo "🏋️  阶段2: 开始训练"
 echo "=========================================="
 echo "模式: $MODE"
+echo "数据集: $CURRENT_DATASET"
 echo ""
 
-./scripts/2_train.sh $MODE  # 从项目根目录运行
+./scripts/2_train.sh "$MODE" --dataset "$CURRENT_DATASET"  # 从项目根目录运行
 
 if [ $? -eq 0 ]; then
     echo ""

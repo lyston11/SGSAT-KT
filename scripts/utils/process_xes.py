@@ -1,6 +1,6 @@
 """
 XES数据集预处理脚本
-将XES数据转换为SGSAT-KT格式，并生成GNN边索引和文本数据
+将XES数据转换为 TriSG-KT 格式，并生成 GNN 边索引和文本数据
 """
 import os
 import sys
@@ -269,7 +269,7 @@ def save_metadata(n_questions, n_kc, n_students, output_dir, dataset_name="xes")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='处理XES数据集用于SGSAT-KT训练')
+    parser = argparse.ArgumentParser(description='处理XES数据集用于 TriSG-KT 训练')
     parser.add_argument('--input', type=str, default='data/xes/xes_math.csv',
                         help='XES数据文件路径')
     parser.add_argument('--output_dir', type=str, default='data',
@@ -293,7 +293,7 @@ def main():
     output_dir = os.path.join(project_root, args.output_dir)
 
     print("=" * 60)
-    print("  XES数据集预处理 - SGSAT-KT")
+    print("  XES数据集预处理 - TriSG-KT")
     print("=" * 60)
 
     # 1. 加载数据
@@ -311,7 +311,7 @@ def main():
         seed=args.seed,
     )
 
-    # 4. 转换为SGSAT-KT格式
+    # 4. 转换为 TriSG-KT 格式
     train_output = os.path.join(output_dir, "xes", "train.txt")
     valid_output = os.path.join(output_dir, "xes", "valid.txt")
     test_output = os.path.join(output_dir, "xes", "test.txt")
