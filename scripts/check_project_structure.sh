@@ -206,15 +206,21 @@ check_output_organization() {
         return
     fi
 
-    # 检查子目录
-    echo "输出目录结构："
-    for dir in output/*/; do
-        if [ -d "$dir" ]; then
-            count=$(find "$dir" -name "*.pt" -o -name "*.pth" 2>/dev/null | wc -l)
-            model_count=$(find "$dir" -name "model-*.pt" 2>/dev/null | wc -l)
-            echo -e "  ${GREEN}✓${NC} ${dir} ($model_count 个模型文件)"
-        fi
-    done
+    if [ -d "output/runs" ]; then
+        echo "检测到新运行目录结构：output/runs/{dataset}/{mode}/{date}/{time_tag}/"
+        find output/runs -mindepth 4 -maxdepth 4 -type d | sort | head -20 | while read -r dir; do
+            best_model_count=$(find "$dir/artifacts" -maxdepth 1 -name "best_model.pt" 2>/dev/null | wc -l)
+            echo -e "  ${GREEN}✓${NC} ${dir} (best_model: ${best_model_count})"
+        done
+    else
+        echo "输出目录结构："
+        for dir in output/*/; do
+            if [ -d "$dir" ]; then
+                model_count=$(find "$dir" \( -name "best_model.pt" -o -name "model-*.pt" -o -name "*.pth" \) 2>/dev/null | wc -l)
+                echo -e "  ${GREEN}✓${NC} ${dir} (${model_count} 个模型文件)"
+            fi
+        done
+    fi
     echo ""
 }
 

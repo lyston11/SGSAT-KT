@@ -8,7 +8,7 @@ from DTransformer.data import Batch, KTData, transform_batch
 class KTDataSubset:
     def __init__(self, base_data, indices, batch_size, shuffle=False):
         self.base_data = base_data
-        self.indices = list(indices)
+        self.indices = [int(index) for index in indices]
         subset = Subset(base_data, self.indices)
         self.loader = DataLoader(
             subset,

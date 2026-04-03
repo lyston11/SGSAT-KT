@@ -27,7 +27,7 @@
 
 ```bash
 ./scripts/train.sh test      # 快速测试（5轮）
-./scripts/train.sh baseline  # 基线模型
+./scripts/train.sh dtransformer  # 官方 DTransformer 基线
 ./scripts/train.sh full      # 完整模型（LLM+GNN）← 推荐
 ./scripts/train.sh full algebra05  # 指定数据集
 ./scripts/train.sh prod      # 生产环境（200轮）
@@ -93,7 +93,7 @@ llm:
 ```yaml
 presets:
   test:      # 快速验证（5轮，无LLM/GNN）
-  baseline:  # 基线模型（100轮，无LLM/GNN）
+  dtransformer:  # 官方 DTransformer 基线（100轮，无LLM/GNN）
   full:      # 完整模型（30轮，LLM+GNN）
   prod:      # 生产环境（200轮，最佳性能）
   sakt:      # SAKT 基线（100轮）
@@ -190,7 +190,7 @@ python DTransformer/preprocess_data.py --dataset doudouyun
 
 # 使用其他模式
 ./scripts/train.sh test      # 快速测试
-./scripts/train.sh baseline  # 基线模型
+./scripts/train.sh dtransformer  # 官方 DTransformer 基线
 ./scripts/train.sh prod      # 生产环境
 ```
 
@@ -334,24 +334,39 @@ llm:
 
 ```
 output/
-├── full_xes_20250321_120000/
-│   ├── config.json          # 配置文件
-│   ├── best_model.pt        # 最佳模型
-│   └── training.log         # 训练日志
+└── runs/
+    └── xes/
+        └── full/
+            └── 2026-04-03/
+                └── 155344_qwen3-4b/
+                    ├── artifacts/
+                    │   └── best_model.pt
+                    ├── metrics/
+                    │   ├── metrics_history.json
+                    │   └── summary.json
+                    └── meta/
+                        ├── config.json
+                        ├── split_info.json
+                        └── run_info.json
 ```
+
+- `artifacts/` 保存模型权重
+- `metrics/` 保存结构化结果
+- `meta/` 保存配置、划分信息和运行状态
+- 训练日志统一在 `logs/` 目录，不再写入 `output/`
 
 ## 🔄 切换预设配置
 
 项目内置了几个预设配置，在 `configs/default.yaml` 的 `presets` 中：
 
 - **test**: 快速测试（5 epochs，无LLM/GNN）
-- **baseline**: 基线模型（100 epochs，无LLM/GNN）
+- **dtransformer**: 官方 DTransformer 基线（100 epochs，无LLM/GNN）
 - **full**: 完整模型（100 epochs，LLM+GNN）
 - **prod**: 生产环境（200 epochs，更大批大小）
 
 ```bash
 ./scripts/train.sh test      # 测试
-./scripts/train.sh baseline  # 基线
+./scripts/train.sh dtransformer  # 官方 DTransformer 基线
 ./scripts/train.sh full      # 完整
 ./scripts/train.sh prod      # 生产
 ./scripts/train.sh sakt      # SAKT 基线
@@ -362,5 +377,5 @@ output/
 
 ## 📞 需要帮助？
 
-检查日志文件：`output/*/training.log`
+检查日志文件：`logs/training_*.log`
 或者查看错误堆栈信息。

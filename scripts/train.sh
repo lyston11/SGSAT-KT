@@ -25,7 +25,7 @@ echo "数据集: $CURRENT_DATASET"
 echo ""
 
 # 阶段1: 检查预计算嵌入（仅 LLM 相关模式需要）
-NO_LLM_MODES="test baseline sakt akt dkt dkvmn"
+NO_LLM_MODES="test dtransformer sakt akt dkt dkvmn"
 NEED_PRECOMPUTE=false
 
 if echo " $NO_LLM_MODES " | grep -q " $MODE "; then
