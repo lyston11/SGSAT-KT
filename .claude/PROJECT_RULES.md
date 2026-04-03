@@ -50,6 +50,8 @@ git switch -c feat/task-name
 - 每个任务必须新建独立分支，不同类型改动不要混在一个分支里
 - 分支命名统一使用：`feat/*`、`fix/*`、`docs/*`、`exp/*`、`release/*`
 - 改完后先做最小验证，再提交，再合并回 `main`
+- 分支合并完成后删除本地已完成分支；下一个任务重新创建新分支
+- 远程分支默认保留，只有用户明确要求时才删除
 
 ### 8. 训练运行期间的 Git 规则（强制）
 
@@ -80,6 +82,7 @@ git switch main
 git pull
 git merge --no-ff feat/task-name
 git push origin main
+git branch -d feat/task-name
 ```
 
 ---
