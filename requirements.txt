@@ -1,4 +1,4 @@
-# SGSAT-KT 依赖项
+# TriSG-KT 依赖项
 # 核心依赖
 torch==2.3.1
 numpy==2.0.2

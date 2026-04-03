@@ -42,7 +42,7 @@ check_root_files() {
     for file in *.md *.txt; do
         if [ -f "$file" ]; then
             case "$file" in
-                README.md|requirements.txt|pyproject.toml|Makefile|CHANGELOG.md|run_*.sh)
+                README.md|requirements.txt|pyproject.toml|Makefile|run_*.sh)
                     echo -e "${GREEN}✓${NC} $file (根目录保留)"
                     ;;
                 *)
@@ -114,7 +114,7 @@ cleanup_files() {
     for file in *.md *.txt; do
         if [ -f "$file" ]; then
             case "$file" in
-                README.md|requirements.txt|pyproject.toml|Makefile|CHANGELOG.md|run_*.sh)
+                README.md|requirements.txt|pyproject.toml|Makefile|run_*.sh)
                     continue
                     ;;
                 *)
@@ -228,7 +228,7 @@ show_project_score() {
     issues=()
 
     # 检查根目录文件
-    non_standard_files=$(find . -maxdepth 1 -type f \( -name "*.md" -o -name "*.txt" -o -name "*.py" -o -name "*.sh" \) ! -name "README.md" ! -name "requirements.txt" ! -name "pyproject.toml" ! -name "Makefile" ! -name "CHANGELOG.md" ! -name "run_*.sh" | wc -l)
+    non_standard_files=$(find . -maxdepth 1 -type f \( -name "*.md" -o -name "*.txt" -o -name "*.py" -o -name "*.sh" \) ! -name "README.md" ! -name "requirements.txt" ! -name "pyproject.toml" ! -name "Makefile" ! -name "run_*.sh" | wc -l)
     if [ "$non_standard_files" -gt 0 ]; then
         issues+=("根目录有 $non_standard_files 个非标准文件 (-10分)")
         score=$((score - 10))

@@ -1,5 +1,5 @@
 """
-Evaluation metrics for SGSAT-KT
+Evaluation metrics for TriSG-KT
 评估指标工具
 """
 

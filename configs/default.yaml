@@ -1,4 +1,4 @@
-# SGSAT-KT Default Configuration
+# TriSG-KT Default Configuration
 # 默认配置文件
 # 注意：只列出实际生效的配置项。每个键都会被训练脚本读取并传递给模型。
 

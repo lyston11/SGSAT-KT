@@ -1,5 +1,5 @@
 """
-Logging utilities for SGSAT-KT
+Logging utilities for TriSG-KT
 日志工具
 """
 

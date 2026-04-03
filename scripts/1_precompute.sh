@@ -5,7 +5,7 @@ echo "🚀 开始预计算Qwen嵌入..."
 echo "⏱️  预计时间: 15分钟"
 echo ""
 
-python scripts/1_precompute.py
+python scripts/1_precompute.py "$@"
 
 if [ $? -eq 0 ]; then
     echo ""
