@@ -1,6 +1,5 @@
 import copy
 
-import tomlkit
 import yaml
 
 from utils.project import CONFIG_DIR, DATA_DIR
@@ -69,6 +68,16 @@ def load_mode_config(mode, dataset=None, device=None, config_name="default.yaml"
     return config
 
 
+def adapt_dataset_config_for_mode(mode, dataset_name, dataset_config):
+    """返回数据集配置副本，保留注册表中的原始字段语义。"""
+    config = copy.deepcopy(dataset_config)
+    config["protocol_name"] = "default"
+    config["protocol_note"] = "use_dataset_registry_as_is"
+    return config
+
+
 def load_dataset_registry():
+    import tomlkit
+
     with (DATA_DIR / "datasets.toml").open("r", encoding="utf-8") as f:
         return tomlkit.load(f)

@@ -2,10 +2,10 @@
 
 `TriSG-KT` 是当前论文中使用的正式模型名，对应“`TriSA-Backbone` 原创序列主干 + 语义增强 + 先决图增强 + 多约束协同优化”的完整知识追踪模型。
 
-**当前版本**: v4.2
+**当前版本**: v4.3
 详细版本记录见 [训练指南](docs/TRAINING.md)
 
-当前 `v4.2` 已包含方法版定型后的工程化补充：训练/预计算链路解耦、多数据集工件隔离、官方 `DTransformer` 基线接入、`pykt` 基线统一封装，以及新的运行输出目录组织方式。
+当前 `v4.3` 在 `v4.2` 工程化底座上继续修正 benchmark 评估协议与基线实现细节，重点包括 `SAKT` 因果注意力修复、无独立 `valid.txt` 数据集的模型选择协议调整，以及基于新协议的基线全量重跑。
 
 ---
 
@@ -62,8 +62,8 @@
 ```
 原始数据
 ├── train.txt / test.txt             → 学生做题序列 (q_id, 正误)
-│                                      若数据集未提供 valid.txt，则训练时从 train.txt
-│                                      按固定随机种子切出验证集，test.txt 仅用于最终评估
+│                                      若数据集未提供 valid.txt，则训练阶段使用 test.txt
+│                                      做模型选择；有独立 valid.txt 时再保留 test.txt 做最终评估
 ├── xes_question_texts.json          → 题目文本 (content + skill)
 ├── xes_kc_texts.json                → 知识点文本
 ├── xes_question_embeddings.pkl      → 预计算嵌入 (7618 × 2560)
@@ -72,7 +72,7 @@
     │
     ↓ DataLoader: Batch(q:[B,200], s:[B,200])
     │
-Embedding 阶段 (TriSG-KT / v4.2)
+Embedding 阶段 (TriSG-KT / v4.3)
     q_id → Embedding(n_q+1, id_dim=128)      → id_emb [B,L,128]
     q_id → pkl查表(2560) → Linear(2560→512)→GELU→LN→Linear(512→256)→LN → e_q [B,L,256]
     kc_id → pkl查表(2560) → 同样多层投影(独立权重) → e_kc [B,L,256]
@@ -137,11 +137,23 @@ conda activate lyston
 ./scripts/1_precompute.sh algebra05      # 为指定数据集单独预计算
 ./scripts/2_train.sh full                # 用默认数据集训练
 ./scripts/2_train.sh full --dataset algebra05
+./scripts/2_train.sh dtransformer --dataset algebra05
+./scripts/2_train.sh sakt --dataset algebra05
+./scripts/2_train.sh akt --dataset algebra05
+./scripts/2_train.sh dkt --dataset algebra05
+./scripts/2_train.sh dkvmn --dataset algebra05
 ```
 
 多数据集并行使用时，预计算嵌入会按数据集分别保存为 `data/embeddings/{dataset}_question_embeddings.pkl`
 和 `data/embeddings/{dataset}_kc_embeddings.pkl`。训练脚本会优先读取对应数据集的文件，
 仍兼容旧的全局 `question_embeddings.pkl` / `kc_embeddings.pkl`。
+当预计算在 GPU 上遇到 CUDA OOM 时，脚本会自动减半 `batch_size`，必要时继续下调 `max_length`，避免大文本数据集反复手动试参。
+当前基线 preset `dtransformer / sakt / akt / dkt / dkvmn` 已统一为固定 `30` 轮，并将 `early_stop` 提高到 `999`，便于直接做对比实验。
+训练侧会自动透传数据集中的 `pid` 字段给支持的基线模型；`akt / dkt / sakt / dkvmn` 使用项目内置的基线实现。
+对于 `assist09 / assist17 / algebra05` 这类同时包含 `q` 与 `pid` 字段的数据集，baseline 现已恢复为严格按 `data/datasets.toml` 中登记的原始字段语义运行，不再在训练时交换 `q/pid` 含义；`full/prod` 主模型也继续使用同一份注册表配置。
+训练评估侧现在同时兼容 `predict()` 返回单个 logits 张量或 `(logits, ...)` 元组两种接口，避免基线在验证阶段因返回协议不一致而出现张量维度错误。
+对于 `DKT / DKVMN / SAKT` 这类不消费 `pid` 的基线，训练入口会自动屏蔽 `pid`，避免在带 `pid` 的数据集上因接口断言而中断整批实验。
+`SAKT` 基线现已修正为严格的 past-only 因果注意力，并在 softmax 后将 masked 权重清零；修复前得到的旧 `SAKT` benchmark 数值不应继续用于论文结论。
 
 ### Benchmark 数据集准备
 ```bash
@@ -149,12 +161,16 @@ python DTransformer/preprocess_data.py --dataset assist09
 python DTransformer/preprocess_data.py --dataset assist17
 python DTransformer/preprocess_data.py --dataset statics
 python DTransformer/preprocess_data.py --dataset doudouyun
+python DTransformer/preprocess_data.py --dataset doudouyun --rebuild_raw
 ```
 
 - `preprocess_data.py` 会按 `data/datasets.toml` 中的 `inputs` 自动解析不同数据集的序列格式
 - 会补齐 `data/text_data/{dataset}_question_texts.json`、`data/text_data/{dataset}_kc_texts.json`
 - 会生成 `data/processed/{dataset}_edge_index.npy` 和 `data/processed/{dataset}_kc_ids.npy`
-- 对 `assist09 / statics / doudouyun` 这类缺少现成文本语料的数据集，当前使用最小合成文本占位来打通 `full` 训练链路，适合 benchmark 对比，不应替代真实文本语义实验
+- 对 `assist09 / statics` 这类缺少现成文本语料的数据集，当前使用最小合成文本占位来打通 `full` 训练链路，适合 benchmark 对比，不应替代真实文本语义实验
+- `doudouyun` 现已支持从 `data/doudouyun/raw/sql_dumps/app_doudouyun2_20240928.sql` 重建正式版数据集
+- 默认会合并 `pingshifen_question_record` 与 `pingshifen_exam_record` 两类交互；如只想保留日常练习，可追加 `--skip_exam_records`
+- 当前全量 `doudouyun` 重建结果为 `17380` 题、`226` 个知识点、`20185` 个用户，训练前需重新执行 `./scripts/1_precompute.sh doudouyun`
 
 ### 调参
 编辑 `configs/default.yaml`
@@ -171,7 +187,7 @@ make smoke-test  # 训练冒烟测试 (5轮快速验证)
 
 ```
 <repo_root>/
-├── baselines/               # 对比基线封装（官方 DTransformer + pykt 基线适配）
+├── baselines/               # 对比基线封装（官方 DTransformer + 其他基线实现）
 ├── configs/
 │   └── default.yaml         # 唯一配置来源
 ├── DTransformer/            # 核心模型代码

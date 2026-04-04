@@ -54,8 +54,6 @@ training:
   save_model: true
   dataset: "xes"  # 默认数据集
   gradient_accumulation_steps: 2  # 梯度累积，模拟batch_size=32
-  validation_ratio: 0.1
-  validation_seed: 42
 
 # GPU Settings（自动选最空闲的单 GPU，DataParallel 对当前模型无效）
 gpu:
@@ -80,8 +78,8 @@ presets:
     training:
       batch_size: 8
       gradient_accumulation_steps: 4
-      n_epochs: 100
-      early_stop: 5
+      n_epochs: 30
+      early_stop: 999
     llm:
       use_llm: false
     gnn:
@@ -122,8 +120,8 @@ presets:
   sakt:
     training:
       batch_size: 32
-      n_epochs: 100
-      early_stop: 5
+      n_epochs: 30
+      early_stop: 999
     llm:
       use_llm: false
     gnn:
@@ -134,8 +132,8 @@ presets:
   akt:
     training:
       batch_size: 32
-      n_epochs: 100
-      early_stop: 5
+      n_epochs: 30
+      early_stop: 999
     llm:
       use_llm: false
     gnn:
@@ -146,8 +144,8 @@ presets:
   dkt:
     training:
       batch_size: 32
-      n_epochs: 100
-      early_stop: 5
+      n_epochs: 30
+      early_stop: 999
     llm:
       use_llm: false
     gnn:
@@ -158,8 +156,8 @@ presets:
   dkvmn:
     training:
       batch_size: 32
-      n_epochs: 100
-      early_stop: 5
+      n_epochs: 30
+      early_stop: 999
     llm:
       use_llm: false
     gnn:

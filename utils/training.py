@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import inspect
 from datetime import datetime
 
 import torch
@@ -19,6 +20,38 @@ def _move_optional_tensor(value, device):
     if value is None:
         return None
     return value.to(device) if isinstance(value, torch.Tensor) else value
+
+
+def _call_model_method(method, q, s, pid=None, kc_ids=None, edge_index=None, q_text=None, seq_len=None):
+    """按模型方法签名裁剪参数，兼容官方/包装后的基线接口。"""
+    parameter_names = inspect.signature(method).parameters
+    owner = getattr(method, "__self__", None)
+    supports_pid = True if owner is None else getattr(owner, "_supports_pid", True)
+    kwargs = {}
+
+    if "pid" in parameter_names:
+        kwargs["pid"] = pid if supports_pid else None
+    if "kc_ids" in parameter_names:
+        kwargs["kc_ids"] = kc_ids
+    if "edge_index" in parameter_names:
+        kwargs["edge_index"] = edge_index
+    if "q_text" in parameter_names:
+        kwargs["q_text"] = q_text
+    if "seq_len" in parameter_names:
+        kwargs["seq_len"] = seq_len
+    if "n" in parameter_names:
+        kwargs["n"] = 1
+
+    return method(q, s, **kwargs)
+
+
+def _extract_logits(prediction_output, reference=None):
+    """兼容 baseline predict 的张量/元组两种返回形式。"""
+    logits = prediction_output[0] if isinstance(prediction_output, (tuple, list)) else prediction_output
+    if isinstance(logits, torch.Tensor) and reference is not None:
+        if logits.dim() == 1 and reference.dim() == 2:
+            logits = logits.unsqueeze(0)
+    return logits
 
 
 def _to_jsonable(value):
@@ -119,7 +152,8 @@ def _resolve_git_revision(project_root):
 
 
 def build_batch_views(batch, config, q_texts=None, tokenizer=None, q_to_kc_mapping=None):
-    if config.get("training_with_pid", config.get("with_pid", False)):
+    has_pid = hasattr(batch, "field_index") and "pid" in getattr(batch, "field_index", {})
+    if has_pid:
         q, s, pid = batch.get("q", "s", "pid")
     else:
         q, s = batch.get("q", "s")
@@ -229,13 +263,27 @@ def train_epoch(
 
             with torch.amp.autocast(device_type="cuda", enabled=use_amp):
                 if use_cl_loss:
-                    loss_out = model_to_use.get_cl_loss(
-                        q, s, pid, current_kc_ids, edge_index, current_q_text, None
+                    loss_out = _call_model_method(
+                        model_to_use.get_cl_loss,
+                        q,
+                        s,
+                        pid=pid,
+                        kc_ids=current_kc_ids,
+                        edge_index=edge_index,
+                        q_text=current_q_text,
+                        seq_len=None,
                     )
                     loss = loss_out[0] if isinstance(loss_out, tuple) else loss_out
                 else:
-                    loss = model_to_use.get_loss(
-                        q, s, pid, current_kc_ids, edge_index, current_q_text, None
+                    loss = _call_model_method(
+                        model_to_use.get_loss,
+                        q,
+                        s,
+                        pid=pid,
+                        kc_ids=current_kc_ids,
+                        edge_index=edge_index,
+                        q_text=current_q_text,
+                        seq_len=None,
                     )
 
             loss = loss / gradient_accumulation_steps
@@ -304,9 +352,17 @@ def validate(
                 model_to_use = _unwrap_model(model)
                 eval_shift = int(getattr(model_to_use, "_eval_shift", 0))
                 with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                    y, *_ = model_to_use.predict(
-                        q, s, pid, current_kc_ids, edge_index, current_q_text, None
+                    prediction_output = _call_model_method(
+                        model_to_use.predict,
+                        q,
+                        s,
+                        pid=pid,
+                        kc_ids=current_kc_ids,
+                        edge_index=edge_index,
+                        q_text=current_q_text,
+                        seq_len=None,
                     )
+                y = _extract_logits(prediction_output, reference=s)
                 if eval_shift > 0:
                     evaluator.evaluate(s[:, eval_shift:], torch.sigmoid(y))
                 else:
@@ -356,6 +412,8 @@ def select_runtime_device(config):
         print("⚠️  配置的 GPU 不可用，回退 CPU")
         return torch.device("cpu")
 
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda:0")
     print(f"📱 使用设备: {device}")
     return device
 
@@ -364,6 +422,9 @@ def initialize_runtime(model, config, baseline_name=None, edge_index=None):
     device = select_runtime_device(config)
     config["device"] = str(device)
     config["training_device"] = str(device)
+
+    if str(device).startswith("cuda"):
+        torch.cuda.set_device(device)
 
     model.to(device)
     if edge_index is not None:

@@ -252,11 +252,13 @@ class SAKT(nn.Module):
         h = self.forward(q_emb, s_emb, mask)
 
         y = self.out(torch.cat([q_emb, h], dim=-1)).squeeze(-1)
-        return y
+        if y.dim() == 1:
+            y = y.unsqueeze(0)
+        return y, h
 
     def get_loss(self, q, s, pid=None):
         # Compute predictions
-        logits = self.predict(q, s, pid)
+        logits, _ = self.predict(q, s, pid)
 
         # Flatten logits and labels to compute BCE loss
         masked_labels = s[s >= 0].float()
@@ -325,9 +327,11 @@ class MultiHeadAttention(nn.Module):
 
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        scores = scores.masked_fill(mask == 0, -1e9)
+        scores = scores.masked_fill(mask == 0, -1e32)
 
         attn_weights = F.softmax(scores, dim=-1)
+        # Keep masked positions strictly zero to avoid uniform fallback on fully masked rows.
+        attn_weights = attn_weights.masked_fill(mask == 0, 0.0)
         attn_output = torch.matmul(attn_weights, v)
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
@@ -337,7 +341,7 @@ class MultiHeadAttention(nn.Module):
 
 
 def future_mask(seq_len, device):
-    """Generate a mask for future tokens."""
-    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    """Only allow attending to strictly previous interactions."""
+    mask = torch.tril(torch.ones(seq_len, seq_len), diagonal=-1).bool()
     return mask.unsqueeze(0).unsqueeze(0).to(device)
 

@@ -93,13 +93,13 @@ llm:
 ```yaml
 presets:
   test:      # 快速验证（5轮，无LLM/GNN）
-  dtransformer:  # 官方 DTransformer 基线（100轮，无LLM/GNN）
+  dtransformer:  # 官方 DTransformer 基线（30轮，无LLM/GNN）
   full:      # 完整模型（30轮，LLM+GNN）
   prod:      # 生产环境（200轮，最佳性能）
-  sakt:      # SAKT 基线（100轮）
-  akt:       # AKT 基线（100轮）
-  dkt:       # DKT 基线（100轮）
-  dkvmn:     # DKVMN 基线（100轮）
+  sakt:      # SAKT 基线（30轮）
+  akt:       # AKT 基线（30轮）
+  dkt:       # DKT 基线（30轮）
+  dkvmn:     # DKVMN 基线（30轮）
 ```
 
 使用方式：
@@ -119,8 +119,6 @@ training:
   n_epochs: 30          # 训练轮数
   learning_rate: 0.001  # 学习率
   device: "cuda"        # 设备 (cuda 或 cpu)
-  validation_ratio: 0.1 # 无 valid 时从 train 切分验证集比例
-  validation_seed: 42   # 无 valid 时的固定随机种子
 ```
 
 ### 功能开关
@@ -178,6 +176,22 @@ python DTransformer/preprocess_data.py --dataset doudouyun
 - 会生成 `data/processed/{dataset}_edge_index.npy` 和 `data/processed/{dataset}_kc_ids.npy`
 - `assist17` 会尽量利用原始 skill label；其余缺少文本的数据集会生成最小合成文本占位
 - 因此这些 benchmark 数据集现在也能直接走 `1_precompute.sh {dataset}` 和 `2_train.sh full --dataset {dataset}`
+
+### 统一外部评测协议
+
+论文对比实验按“统一外部评测协议”执行：
+
+- 所有模型共享同一份原始 `train / valid / test` 划分逻辑与同一套指标计算方式。
+- baseline 按 `data/datasets.toml` 中登记的原始字段语义运行。
+- `TriSG-KT` 按自身设计运行，但仍使用相同的外部数据划分和测试集。
+
+对于 `assist09 / assist17 / algebra05` 这类同时包含 `problem_id` 和 `concept_id` 的数据集：
+
+- `full / prod / test` 主模型模式保持当前项目的数据语义不变。
+- `dtransformer / sakt / akt / dkt / dkvmn` baseline 模式不再额外交换 `q / pid`。
+- 基线和主模型都统一读取 `data/datasets.toml` 中的数据字段顺序与计数配置。
+
+这样做的目的是避免训练入口额外篡改字段语义，确保基线模型实际接收到的输入与数据注册表、预处理产物和模型实现本身保持一致。
 
 ## 🚀 使用方法
 

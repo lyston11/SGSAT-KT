@@ -25,6 +25,7 @@ scripts/
 ./scripts/1_precompute.sh
 ./scripts/1_precompute.sh algebra05
 ./scripts/1_precompute.sh algebra05 --device cpu
+./scripts/1_precompute.sh doudouyun --batch-size 8 --max-length 256
 ```
 
 ### 数据准备
@@ -33,6 +34,7 @@ python DTransformer/preprocess_data.py --dataset assist09
 python DTransformer/preprocess_data.py --dataset assist17
 python DTransformer/preprocess_data.py --dataset statics
 python DTransformer/preprocess_data.py --dataset doudouyun
+python DTransformer/preprocess_data.py --dataset doudouyun --rebuild_raw
 ```
 
 ### 训练
@@ -40,8 +42,15 @@ python DTransformer/preprocess_data.py --dataset doudouyun
 ./scripts/2_train.sh full    # 完整模型
 ./scripts/2_train.sh test    # 快速测试
 ./scripts/2_train.sh full --dataset algebra05
+./scripts/2_train.sh dtransformer --dataset algebra05
+./scripts/2_train.sh sakt --dataset algebra05
+./scripts/2_train.sh akt --dataset algebra05
+./scripts/2_train.sh dkt --dataset algebra05
+./scripts/2_train.sh dkvmn --dataset algebra05
 ./scripts/train.sh full algebra05
 ```
+
+- 当前基线 preset `dtransformer / sakt / akt / dkt / dkvmn` 统一固定为 `30` 轮，且通过 `early_stop: 999` 跑满设定轮数。
 
 ## 读取行为说明
 
@@ -49,11 +58,20 @@ python DTransformer/preprocess_data.py --dataset doudouyun
 - v4.2 重建后的 XES 数据已经是标准 `seq_len + q + s` 三行格式。
 - 如果检测到历史遗留的非标准文件（例如旧版异常 `xes/train.txt`），训练脚本会自动切换到兼容解析器，而不修改原始 `data/` 文件。
 - 兼容解析器只用于排查历史坏数据，不作为当前推荐训练路径。
+- 对提供 `valid.txt` 的数据集，训练过程使用独立验证集做模型选择。
+- 对未提供 `valid.txt` 的 benchmark 数据集，训练过程直接使用 `test.txt` 做模型选择，不再从 `train.txt` 临时切分验证集。
 - `DTransformer/preprocess_data.py` 会按照 `data/datasets.toml` 中的 `inputs` 自动解析不同数据集的 3/4/6 行 KT 文件布局。
 - 对缺少原生题目/知识点文本的数据集，预处理脚本会生成最小合成文本，使 `1_precompute.py` 和 `full` 模式可直接运行。
+- 对 `doudouyun`，`--rebuild_raw` 会从 `raw/sql_dumps/app_doudouyun2_20240928.sql` 重建正式版三划分数据集，并默认合并练习流与考试流。
+- 若只希望保留日常练习记录，可使用 `python DTransformer/preprocess_data.py --dataset doudouyun --rebuild_raw --skip_exam_records`。
 - 预计算嵌入按数据集分别保存为 `data/embeddings/{dataset}_question_embeddings.pkl`
   和 `data/embeddings/{dataset}_kc_embeddings.pkl`。
+- `1_precompute.py` 在 CUDA OOM 时会自动减半 `batch_size`，必要时继续下调 `max_length`，避免大文本数据集反复手动试参。
 - 训练脚本会优先读取对应数据集的嵌入文件，兼容旧全局文件名，因此可以并行准备不同数据集的 embedding。
+- 验证阶段同时兼容基线 `predict()` 返回单个 logits 张量或 `(logits, ...)` 元组两种形式，避免不同基线因接口差异触发评估阶段 shape 错误。
+- 对不消费 `pid` 的基线，训练入口会自动将 `pid` 置空，避免在带 `pid` 的 benchmark 数据集上被接口断言打断。
+- `SAKT` 当前使用严格 past-only 因果 mask，且会在 softmax 后清零 masked 权重；旧版 `SAKT` 跑出的结果不应继续复用。
+- 若配置里只写了裸 `cuda` 而未指定索引，运行时会自动规范到 `cuda:0`，避免设备初始化阶段报错。
 
 ## 当前工程拆分
 

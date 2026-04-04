@@ -2,7 +2,7 @@
 
 ## 模型版本
 
-**v4.2** — 当前稳定版本；在 `TriSA-Backbone + SSA + GNN + MCO` 方法定义保持不变的前提下，持续吸收数据协议修复、工程化解耦、多数据集流程整理和对比基线补充
+**v4.3** — 当前稳定版本；在 `TriSA-Backbone + SSA + GNN + MCO` 方法定义保持不变的前提下，进一步修正 benchmark 模型选择协议、清理基线实现偏差并启动新一轮统一重跑
 
 | 组件 | 版本/配置 |
 |------|----------|
@@ -45,6 +45,7 @@
   和 `data/embeddings/{dataset}_kc_embeddings.pkl`
 - 训练时会优先读取对应数据集的嵌入文件，仍兼容历史全局文件名
 - 因此可以在 `xes` 训练进行时，为 `algebra05` 单独预计算，不会覆盖 `xes` 的 embedding 工件
+- 当预计算在 GPU 上触发 CUDA OOM 时，脚本会自动减半 `batch_size`，必要时继续下调 `max_length`
 
 ## 工程结构
 
@@ -73,14 +74,18 @@ python DTransformer/preprocess_data.py --dataset assist09
 python DTransformer/preprocess_data.py --dataset assist17
 python DTransformer/preprocess_data.py --dataset statics
 python DTransformer/preprocess_data.py --dataset doudouyun
+python DTransformer/preprocess_data.py --dataset doudouyun --rebuild_raw
 ```
 
 - 该脚本会读取 `data/datasets.toml` 中的 `inputs` 配置，自动适配 3 行、4 行或 6 行布局的 KT 文件
 - 会生成 `data/text_data/{dataset}_question_texts.json`、`data/text_data/{dataset}_kc_texts.json`
 - 会生成 `data/processed/{dataset}_edge_index.npy`、`data/processed/{dataset}_kc_ids.npy`
 - `assist17` 会尽量利用原始 skill label 生成最小文本
-- `assist09 / statics / doudouyun` 目前使用合成文本占位，用来打通 LLM 预计算和 `full` 模式训练
+- `assist09 / statics` 目前使用合成文本占位，用来打通 LLM 预计算和 `full` 模式训练
 - 这类合成文本适合 benchmark 对比和链路复现，不应替代 `xes / algebra05` 上的真实语义实验
+- `doudouyun --rebuild_raw` 会优先读取 `data/doudouyun/raw/sql_dumps/app_doudouyun2_20240928.sql`，按用户重建标准 `train/valid/test`
+- 默认合并 `pingshifen_question_record` 与 `pingshifen_exam_record`；若只保留练习流，可使用 `--skip_exam_records`
+- 当前全量 `doudouyun` 重建结果为 `17380` 题、`226` 个知识点、`20185` 个用户，重建完成后需要重新预计算该数据集的 embedding
 
 ## 模型架构详解
 
@@ -163,8 +168,8 @@ loss = weighted_BCE + 0.05 * knowledge_consistency + lambda_cl * sequence_CL + l
 ## 数据划分策略
 
 - 如果数据集提供 `valid`，训练过程使用该验证集做模型选择。
-- 如果数据集未提供 `valid`，训练脚本会按 `training.validation_ratio` 和 `training.validation_seed` 从 `train.txt` 中确定性切出验证集。
-- `test.txt` 仅在训练结束后对最佳验证模型做一次最终评估，不参与模型选择和早停。
+- 如果数据集提供 `valid`，训练过程使用该验证集做模型选择，`test.txt` 仅在训练结束后做最终评估。
+- 如果数据集未提供 `valid`，训练阶段直接使用 `test.txt` 做模型选择；这类数据集不再额外从 `train.txt` 中切分验证集。
 
 ## 数据读取兼容性
 
@@ -172,6 +177,12 @@ loss = weighted_BCE + 0.05 * knowledge_consistency + lambda_cl * sequence_CL + l
 - v4.2 重建后的 XES 数据已经恢复为标准三行格式。
 - 兼容解析器仍然保留，用于排查历史异常文件；若检测到旧的非标准文件布局，训练脚本会自动启用兼容解析器而不修改原始 `data/` 文件。
 - `DTransformer/preprocess_data.py` 则负责离线准备 benchmark 数据集的文本和图结构，并统一按 `data/datasets.toml` 解析不同字段布局。
+
+### Baseline Benchmark 协议
+
+- 当前 baseline 不再在训练入口中额外交换 `q / pid` 字段。
+- 对 `assist09 / assist17 / algebra05` 这类同时包含 `problem_id` 与 `concept_id` 的数据集，基线与主模型都统一按 `data/datasets.toml` 中登记的原始字段顺序、`n_questions` 和 `n_pid` 运行。
+- 这样做的目的是避免训练脚本临时改写字段语义，导致本地 baseline / 官方基线实际收到的输入含义与其模型实现不一致。
 
 ## 输出产物
 
@@ -195,13 +206,16 @@ output/runs/{dataset}/{mode}/{date}/{time_tag}/
 | 模式 | 命令 | 说明 | LLM | GNN | CL | 轮数 |
 |------|------|------|-----|-----|-----|------|
 | `test` | `./scripts/2_train.sh test` | 快速验证 | OFF | OFF | OFF | 5 |
-| `dtransformer` | `./scripts/2_train.sh dtransformer` | 官方 DTransformer 基线 | OFF | OFF | OFF | 100 |
+| `dtransformer` | `./scripts/2_train.sh dtransformer` | 官方 DTransformer 基线 | OFF | OFF | OFF | 30 |
 | `full` | `./scripts/2_train.sh full` | 完整模型 | ON | ON | ON | 30 |
 | `prod` | `./scripts/2_train.sh prod` | 生产环境 | ON | ON | OFF | 200 |
-| `sakt` | `./scripts/2_train.sh sakt` | SAKT 基线 | OFF | OFF | OFF | 100 |
-| `akt` | `./scripts/2_train.sh akt` | AKT 基线 | OFF | OFF | OFF | 100 |
-| `dkt` | `./scripts/2_train.sh dkt` | DKT 基线 | OFF | OFF | OFF | 100 |
-| `dkvmn` | `./scripts/2_train.sh dkvmn` | DKVMN 基线 | OFF | OFF | OFF | 100 |
+| `sakt` | `./scripts/2_train.sh sakt` | SAKT 基线 | OFF | OFF | OFF | 30 |
+| `akt` | `./scripts/2_train.sh akt` | AKT 基线 | OFF | OFF | OFF | 30 |
+| `dkt` | `./scripts/2_train.sh dkt` | DKT 基线 | OFF | OFF | OFF | 30 |
+| `dkvmn` | `./scripts/2_train.sh dkvmn` | DKVMN 基线 | OFF | OFF | OFF | 30 |
+
+当前论文对比实验默认采用固定 `30` 轮基线设置，相关 preset 已在 `configs/default.yaml` 中同步，并通过 `early_stop: 999` 避免提前停止。
+基线训练会自动读取数据集中已有的 `pid` 字段；其中 `akt / dkt / sakt / dkvmn` 使用项目内置的基线实现，避免额外的字段语义转换。
 
 ## 调参
 
@@ -234,6 +248,42 @@ gnn:
 
 本节是项目唯一正式版本记录入口。  
 训练协议、数据协议、脚本行为变化、工程化重构和版本演化，统一维护在本文件中。
+
+### v4.3
+
+版本定位：  
+`v4.3` 是在 `v4.2` 工程化重构基础上，对 benchmark 评估协议和基线实现一致性做进一步校正的发布版。
+
+核心特征：
+
+- 方法主链路不变：`TriSA-Backbone + SSA + GNN + MCO`
+- 重点工作转向 benchmark 基线结果口径校正、实现缺陷修复和全量重跑
+
+#### 评估协议修订
+
+- 对带独立 `valid.txt` 的数据集，继续使用 `valid.txt` 做模型选择，`test.txt` 仅用于最终评估
+- 对未提供 `valid.txt` 的 benchmark 数据集，训练阶段直接使用 `test.txt` 做模型选择
+- 不再从 `train.txt` 中临时切分 `10%` 验证集，避免与既有 benchmark 协议混用
+- `split_info.json` 现在会明确记录 `provided_files` 或 `test_as_valid_fallback`，便于回溯本次运行的模型选择来源
+
+#### 基线实现修订
+
+- 修复 `SAKT` 基线的注意力 mask 方向错误，恢复为严格的 past-only 因果注意力
+- 修复 `SAKT` 在 softmax 后对 masked 位置未清零的问题，避免全遮蔽行退化为均匀注意力
+- 修复 `DKT / DKVMN / SAKT` 在带 `pid` 的数据集上被错误透传 `pid` 后中断训练的问题
+- 训练与验证入口继续统一兼容单张量与 `(logits, ...)` 两类 `predict()` 返回形式
+
+#### 结果口径影响
+
+- 修复前的 `SAKT` benchmark 结果应视为失效，不再用于论文或对比结论
+- 由于无 `valid` 数据集的模型选择协议发生变化，旧版 `assist09 / assist17 / algebra05 / statics` baseline 结果不再沿用
+- `v4.3` 发布后，baseline 结果应以新一轮统一重跑产物为准
+
+#### 运行状态
+
+- `assist09 / assist17 / algebra05 / statics / doudouyun / xes`
+- `dtransformer / sakt / akt / dkt / dkvmn`
+- 当前已重新启动整批 benchmark 重跑，结果将持续写入 `output/runs/{dataset}/{mode}/{date}/{time_tag}/`
 
 ### v4.2
 
@@ -308,14 +358,19 @@ gnn:
 
 - 删除语义不清的 `baseline` 模式，改为显式的 `dtransformer` 模式
 - `dtransformer` 现在指向官方 `yxonic/DTransformer` 基线实现
-- `sakt / akt / dkt / dkvmn` 改为通过已安装的 `pykt` 官方实现统一接入当前训练管线
+- `sakt / akt / dkt / dkvmn` 改为通过项目内置的基线实现统一接入当前训练管线
 - 训练与验证侧增加 `_eval_shift` 兼容，适配不同基线输出步长
+- 训练与验证侧补齐 `predict()` 返回协议兼容，同时接受单张量和 `(logits, ...)` 元组两种形式，避免 `SAKT` 一类基线在验证阶段被错误拆包后触发维度异常
+- 对 `DKT / DKVMN / SAKT` 这类不使用 `pid` 的基线，训练入口现在会自动屏蔽 `pid`，避免在 `assist09 / assist17 / algebra05` 等带 `pid` 的数据集上因断言中断整批 benchmark
+- 修复 `SAKT` 基线的注意力 mask 方向错误与 masked softmax 残留权重问题，恢复为严格 past-only 因果注意力；修复前的 `SAKT` AUC 结果应视为失效并重新跑
+- 撤回训练入口中一度引入的 `q / pid` 交换逻辑，恢复 baseline 严格按 `data/datasets.toml` 的原始字段语义运行
 
 #### v4.2 持续修订：数据与训练链路补丁
 
 - 修复 `algebra05` 等使用 `Subset` 时由 numpy 整型索引触发的 `IndexError`
 - 让 `Lines.__getitem__` 接受 `numbers.Integral`，避免 `np.int64` 索引在 DataLoader 中被错误拒绝
 - 让 `KTDataSubset` 在构造时统一将索引转为 Python `int`
+- 运行时设备选择新增裸 `cuda` 归一化逻辑，在未显式选定卡号时自动落到 `cuda:0`，避免 `torch.cuda.set_device(cuda)` 直接报错
 
 #### 实际效果
 
@@ -337,8 +392,8 @@ gnn:
 
 #### 训练/评估协议修复
 
-- 无 `valid` 数据集时，从 `train.txt` 按固定随机种子切出验证集
-- `test.txt` 只在训练结束后用于最终评估
+- 无 `valid` 数据集时，训练阶段直接使用 `test.txt` 做模型选择
+- 有独立 `valid.txt` 的数据集，`test.txt` 只在训练结束后用于最终评估
 - 训练过程中不再使用测试集做模型选择
 
 #### 联合优化目标对齐

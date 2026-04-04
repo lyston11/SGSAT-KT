@@ -14,7 +14,6 @@ sys.path.insert(0, project_root)
 
 from utils.data_pipeline import (
     build_data_source as pipeline_build_data_source,
-    build_generated_valid_split as pipeline_build_generated_valid_split,
     load_edge_index as pipeline_load_edge_index,
     load_precomputed_embeddings as pipeline_load_precomputed_embeddings,
     load_q_to_kc_mapping as pipeline_load_q_to_kc_mapping,
@@ -23,6 +22,7 @@ from utils.data_pipeline import (
     validate_precomputed_embeddings as pipeline_validate_precomputed_embeddings,
 )
 from utils.experiment import (
+    adapt_dataset_config_for_mode,
     flatten_config as flatten_runtime_config,
     load_dataset_registry,
     load_mode_config,
@@ -89,7 +89,21 @@ def main():
     print("\n📂 加载数据...")
     datasets = load_dataset_registry()
     dataset_name = config.get('training_dataset', config.get('dataset', 'xes'))
-    dataset_config = datasets[dataset_name]
+    dataset_config = adapt_dataset_config_for_mode(
+        args.mode,
+        dataset_name,
+        datasets[dataset_name],
+    )
+    if dataset_config.get("protocol_name") != "default":
+        print(
+            "ℹ️  启用 benchmark baseline 数据协议: "
+            f"{dataset_config['protocol_note']}"
+        )
+        print(
+            f"   inputs={list(dataset_config['inputs'])}, "
+            f"n_questions={dataset_config['n_questions']}, "
+            f"n_pid={dataset_config.get('n_pid', 0)}"
+        )
 
     # 检查预计算嵌入（仅 use_llm=True 时有意义）
     if config.get('use_precomputed', False) and config.get('use_llm', False):
@@ -131,23 +145,39 @@ def main():
             "source": "provided_files",
             "train_path": dataset_config["train"],
             "valid_path": dataset_config["valid"],
+            "dataset_protocol": dataset_config.get("protocol_name", "default"),
+            "dataset_inputs": list(dataset_config["inputs"]),
+            "n_questions": int(dataset_config["n_questions"]),
+            "n_pid": int(dataset_config.get("n_pid", 0)),
         }
     else:
-        valid_ratio = float(config.get('training_validation_ratio', config.get('validation_ratio', 0.1)))
-        valid_seed = int(config.get('training_validation_seed', config.get('validation_seed', 42)))
-        train_data, valid_data, split_info = pipeline_build_generated_valid_split(
+        train_data = pipeline_build_data_source(
             train_path,
             dataset_config["inputs"],
-            seq_len,
-            batch_size,
-            test_batch_size,
-            valid_ratio=valid_ratio,
-            seed=valid_seed,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            shuffle=True,
+        )
+        valid_data = pipeline_build_data_source(
+            os.path.join(data_dir, dataset_config["test"]),
+            dataset_config["inputs"],
+            batch_size=test_batch_size,
+            seq_len=seq_len,
+            shuffle=False,
         )
         print(
-            f"⚠️  数据集未提供 valid 划分，已从 train.txt 中生成验证集 "
-            f"(ratio={valid_ratio:.2f}, seed={valid_seed})"
+            "⚠️  数据集未提供 valid 划分，训练阶段将使用 test.txt 做模型选择"
         )
+        split_info = {
+            "source": "test_as_valid_fallback",
+            "train_path": dataset_config["train"],
+            "valid_path": dataset_config["test"],
+            "test_path": dataset_config["test"],
+            "dataset_protocol": dataset_config.get("protocol_name", "default"),
+            "dataset_inputs": list(dataset_config["inputs"]),
+            "n_questions": int(dataset_config["n_questions"]),
+            "n_pid": int(dataset_config.get("n_pid", 0)),
+        }
 
     # 独立测试集（训练中不使用，仅在训练结束后做最终评估）
     test_data = None
@@ -276,7 +306,7 @@ def main():
             seq_len=seq_len,
             device='cpu',
         )
-        print(f"✅ pykt 基线模型创建完成: {baseline_name}")
+        print(f"✅ 基线模型创建完成: {baseline_name}")
     else:
         # 确保 n_kc 配置正确
         final_n_kc = config.get('gnn_n_kc', config.get('n_kc', 100))

@@ -47,6 +47,12 @@ def main():
         default=32,
         help="编码批大小，默认 32",
     )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=256,
+        help="文本编码最大 token 长度，默认 256；OOM 时会进一步自动下调",
+    )
     args = parser.parse_args()
 
     print(f"📌 使用本地模型目录: {resolved_model_path}")
@@ -71,6 +77,7 @@ def main():
             project_path("data", "embeddings", f"{dataset_name}_question_embeddings.pkl"),
             batch_size=args.batch_size,
             dataset_name=dataset_name,
+            max_length=args.max_length,
         )
     else:
         print(f"⚠️  文件不存在: {q_file}")
@@ -88,6 +95,7 @@ def main():
             project_path("data", "embeddings", f"{dataset_name}_kc_embeddings.pkl"),
             batch_size=args.batch_size,
             dataset_name=dataset_name,
+            max_length=args.max_length,
         )
     else:
         print(f"⚠️  文件不存在: {kc_file}")

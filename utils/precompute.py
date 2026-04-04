@@ -1,34 +1,86 @@
 import json
 import os
 import pickle
+import sys
+import types
+from enum import Enum
+from importlib.machinery import ModuleSpec
 
 import torch
-from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
 
 from utils.project import project_path
 
 
+def _install_torchvision_stub():
+    """为当前环境提供最小 torchvision stub，避免 transformers 在文本链路中误触发损坏的 vision 依赖。"""
+    if "torchvision" in sys.modules:
+        return
+
+    class InterpolationMode(Enum):
+        NEAREST = "nearest"
+        NEAREST_EXACT = "nearest-exact"
+        BILINEAR = "bilinear"
+        BICUBIC = "bicubic"
+        BOX = "box"
+        HAMMING = "hamming"
+        LANCZOS = "lanczos"
+
+    torchvision_module = types.ModuleType("torchvision")
+    torchvision_module.__spec__ = ModuleSpec("torchvision", loader=None)
+
+    transforms_module = types.ModuleType("torchvision.transforms")
+    transforms_module.__spec__ = ModuleSpec("torchvision.transforms", loader=None)
+    transforms_module.InterpolationMode = InterpolationMode
+    torchvision_module.transforms = transforms_module
+
+    for submodule_name in ("io", "datasets", "models", "ops", "utils", "_meta_registrations"):
+        module_name = f"torchvision.{submodule_name}"
+        submodule = types.ModuleType(module_name)
+        submodule.__spec__ = ModuleSpec(module_name, loader=None)
+        setattr(torchvision_module, submodule_name, submodule)
+        sys.modules[module_name] = submodule
+
+    sys.modules["torchvision"] = torchvision_module
+    sys.modules["torchvision.transforms"] = transforms_module
+
+
+_install_torchvision_stub()
+
+from transformers import AutoModel, AutoTokenizer
+
+
 class QwenEmbeddingGenerator:
-    """Qwen 语义嵌入生成器 (使用 sentence-transformers)"""
+    """Qwen 语义嵌入生成器。"""
 
     def __init__(self, model_path="pretrained_models/qwen3-4b", device="cuda"):
-        self.device = device if torch.cuda.is_available() else "cpu"
+        self.device = device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
         self.model_path = model_path
         print(f"📦 加载 Qwen 模型: {model_path}")
         print(f"🔧 设备: {self.device}")
 
         local_only = os.path.isdir(model_path)
-        model_kwargs = {"trust_remote_code": True}
+        common_kwargs = {"trust_remote_code": True}
         if local_only:
-            model_kwargs["local_files_only"] = True
+            common_kwargs["local_files_only"] = True
 
-        self.model = SentenceTransformer(
+        self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            device=self.device,
-            model_kwargs=model_kwargs,
-            tokenizer_kwargs={"local_files_only": local_only},
+            use_fast=False,
+            **common_kwargs,
         )
-        self.hidden_size = self.model.get_sentence_embedding_dimension()
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        torch_dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            dtype=torch_dtype,
+            **common_kwargs,
+        )
+        self.model.to(self.device)
+        self.model.eval()
+        self.hidden_size = int(getattr(self.model.config, "hidden_size"))
         print(f"✅ 模型加载完成，嵌入维度: {self.hidden_size}")
 
     @staticmethod
@@ -43,15 +95,78 @@ class QwenEmbeddingGenerator:
             return ""
         return str(entry)
 
-    def batch_encode_texts(self, texts, batch_size=32):
-        return self.model.encode(
-            texts,
-            batch_size=batch_size,
-            convert_to_numpy=True,
-            show_progress_bar=True,
-        )
+    @staticmethod
+    def is_cuda_oom(exc):
+        message = str(exc).lower()
+        return "out of memory" in message or "cuda out of memory" in message
 
-    def precompute_question_embeddings(self, questions_data, output_path, batch_size=32, dataset_name=None):
+    def _clear_cuda_cache(self):
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def batch_encode_texts(self, texts, batch_size=32, max_length=256):
+        embeddings = []
+
+        current_batch_size = max(1, int(batch_size))
+        current_max_length = max(64, int(max_length))
+        progress = tqdm(total=len(texts), desc="编码", leave=False)
+        start = 0
+
+        try:
+            with torch.no_grad():
+                while start < len(texts):
+                    batch_texts = texts[start : start + current_batch_size]
+                    try:
+                        encoded = self.tokenizer(
+                            batch_texts,
+                            padding=True,
+                            truncation=True,
+                            max_length=current_max_length,
+                            return_tensors="pt",
+                        )
+                        encoded = {key: value.to(self.device) for key, value in encoded.items()}
+                        outputs = self.model(**encoded)
+                        hidden_states = outputs.last_hidden_state
+                        attention_mask = encoded["attention_mask"].unsqueeze(-1)
+                        masked_hidden = hidden_states * attention_mask
+                        pooled = masked_hidden.sum(dim=1) / attention_mask.sum(dim=1).clamp(min=1)
+                        embeddings.append(pooled.detach().float().cpu())
+                        start += len(batch_texts)
+                        progress.update(len(batch_texts))
+                    except torch.OutOfMemoryError as exc:
+                        if not self.device.startswith("cuda") or not self.is_cuda_oom(exc):
+                            raise
+                        self._clear_cuda_cache()
+                        if current_batch_size > 1:
+                            next_batch_size = max(1, current_batch_size // 2)
+                            print(
+                                f"⚠️  预计算发生 CUDA OOM，自动将 batch_size "
+                                f"{current_batch_size} -> {next_batch_size}"
+                            )
+                            current_batch_size = next_batch_size
+                            continue
+                        if current_max_length > 128:
+                            next_max_length = max(128, current_max_length // 2)
+                            print(
+                                f"⚠️  单条样本仍触发 CUDA OOM，自动将 max_length "
+                                f"{current_max_length} -> {next_max_length}"
+                            )
+                            current_max_length = next_max_length
+                            continue
+                        raise
+        finally:
+            progress.close()
+
+        return torch.cat(embeddings, dim=0).numpy()
+
+    def precompute_question_embeddings(
+        self,
+        questions_data,
+        output_path,
+        batch_size=32,
+        dataset_name=None,
+        max_length=256,
+    ):
         print(f"📝 预计算 {len(questions_data)} 个题目嵌入...")
 
         question_ids = sorted(questions_data.keys(), key=lambda x: int(x))
@@ -67,6 +182,7 @@ class QwenEmbeddingGenerator:
         question_embeddings = self.batch_encode_texts(
             question_texts,
             batch_size=batch_size,
+            max_length=max_length,
         )
 
         result = {
@@ -84,7 +200,14 @@ class QwenEmbeddingGenerator:
         print(f"✅ 题目嵌入已保存: {output_path}")
         return result
 
-    def precompute_kc_embeddings(self, kc_data, output_path, batch_size=32, dataset_name=None):
+    def precompute_kc_embeddings(
+        self,
+        kc_data,
+        output_path,
+        batch_size=32,
+        dataset_name=None,
+        max_length=256,
+    ):
         print(f"📚 预计算 {len(kc_data)} 个知识点嵌入...")
 
         kc_ids = sorted(kc_data.keys(), key=lambda x: int(x))
@@ -93,6 +216,7 @@ class QwenEmbeddingGenerator:
         kc_embeddings = self.batch_encode_texts(
             kc_texts,
             batch_size=batch_size,
+            max_length=max_length,
         )
 
         result = {
